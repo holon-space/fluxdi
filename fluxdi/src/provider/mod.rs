@@ -67,12 +67,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info};
 
 #[cfg(all(feature = "async-factory", not(feature = "thread-safe")))]
-type AsyncFactory<T> =
-    Box<dyn Fn(Injector) -> Pin<Box<dyn Future<Output = Instance<T>> + 'static>> + 'static>;
+type AsyncFactory<T> = Box<
+    dyn Fn(Injector) -> Pin<Box<dyn Future<Output = Result<Instance<T>, Error>> + 'static>>
+        + 'static,
+>;
 
 #[cfg(all(feature = "async-factory", feature = "thread-safe"))]
 type AsyncFactory<T> = Box<
-    dyn Fn(Injector) -> Pin<Box<dyn Future<Output = Instance<T>> + Send + 'static>>
+    dyn Fn(Injector) -> Pin<Box<dyn Future<Output = Result<Instance<T>, Error>> + Send + 'static>>
         + Send
         + Sync
         + 'static,

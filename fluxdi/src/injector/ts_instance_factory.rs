@@ -209,7 +209,7 @@ impl Injector {
             );
 
             if let Some(async_factory) = &provider_ref.async_factory {
-                let instance = Shared::new((async_factory)(self.clone()).await);
+                let instance = Shared::new((async_factory)(self.clone()).await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
@@ -288,7 +288,7 @@ impl Injector {
             );
 
             if let Some(async_factory) = &provider_ref.async_factory {
-                let instance = Shared::new((async_factory)(self.clone()).await);
+                let instance = Shared::new((async_factory)(self.clone()).await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
@@ -369,7 +369,7 @@ impl Injector {
             );
 
             if let Some(async_factory) = &provider_ref.async_factory {
-                let instance = Shared::new((async_factory)(self.clone()).await);
+                let instance = Shared::new((async_factory)(self.clone()).await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(

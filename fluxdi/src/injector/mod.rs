@@ -283,6 +283,8 @@ mod core_lifecycle;
 mod dynamic_tests;
 #[cfg(all(test, feature = "eager-resolution"))]
 mod eager_resolution_tests;
+#[cfg(all(test, feature = "async-factory"))]
+mod fallible_async_factory_tests;
 mod graph_state;
 mod graph_validation;
 

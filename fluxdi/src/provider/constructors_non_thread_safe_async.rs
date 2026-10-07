@@ -9,41 +9,13 @@ impl<T: ?Sized + 'static> Provider<T> {
         F: Fn(Injector) -> Fut + 'static,
         Fut: Future<Output = Shared<T>> + 'static,
     {
-        #[cfg(feature = "tracing")]
-        info!(
-            type_name = std::any::type_name::<T>(),
-            scope = %Scope::Module,
-            threading = "single-threaded",
-            factory_mode = "async",
-            "Creating async singleton provider"
-        );
-
-        Provider::<T> {
-            scope: Scope::Module,
-            factory: Box::new(|_| {
-                panic!(
-                    "async provider cannot be used with try_resolve/resolve; use try_resolve_async/resolve_async"
-                )
-            }),
-            async_factory: Some(Box::new(move |injector| {
-                Box::pin({
-                    let future = factory(injector);
-                    async move {
-                        #[cfg(feature = "tracing")]
-                        debug!(
-                            type_name = std::any::type_name::<T>(),
-                            scope = %Scope::Module,
-                            op = "provider_factory_call_async",
-                            "Executing async singleton factory"
-                        );
-                        Instance::new(future.await)
-                    }
-                })
-            })),
-            limits: Limits::default(),
-            dependency_hints: Vec::new(),
-            limiter: None,
-        }
+        Self::try_async_with_scope::<_, _, std::convert::Infallible>(
+            Scope::Module,
+            move |injector| {
+                let future = factory(injector);
+                async move { Ok(future.await) }
+            },
+        )
     }
 
     /// Creates a transient provider whose factory resolves asynchronously.
@@ -53,41 +25,13 @@ impl<T: ?Sized + 'static> Provider<T> {
         F: Fn(Injector) -> Fut + 'static,
         Fut: Future<Output = Shared<T>> + 'static,
     {
-        #[cfg(feature = "tracing")]
-        info!(
-            type_name = std::any::type_name::<T>(),
-            scope = %Scope::Transient,
-            threading = "single-threaded",
-            factory_mode = "async",
-            "Creating async transient provider"
-        );
-
-        Provider::<T> {
-            scope: Scope::Transient,
-            factory: Box::new(|_| {
-                panic!(
-                    "async provider cannot be used with try_resolve/resolve; use try_resolve_async/resolve_async"
-                )
-            }),
-            async_factory: Some(Box::new(move |injector| {
-                Box::pin({
-                    let future = factory(injector);
-                    async move {
-                        #[cfg(feature = "tracing")]
-                        debug!(
-                            type_name = std::any::type_name::<T>(),
-                            scope = %Scope::Transient,
-                            op = "provider_factory_call_async",
-                            "Executing async transient factory"
-                        );
-                        Instance::new(future.await)
-                    }
-                })
-            })),
-            limits: Limits::default(),
-            dependency_hints: Vec::new(),
-            limiter: None,
-        }
+        Self::try_async_with_scope::<_, _, std::convert::Infallible>(
+            Scope::Transient,
+            move |injector| {
+                let future = factory(injector);
+                async move { Ok(future.await) }
+            },
+        )
     }
 
     /// Creates a root-scoped provider whose factory resolves asynchronously.
@@ -97,41 +41,10 @@ impl<T: ?Sized + 'static> Provider<T> {
         F: Fn(Injector) -> Fut + 'static,
         Fut: Future<Output = Shared<T>> + 'static,
     {
-        #[cfg(feature = "tracing")]
-        info!(
-            type_name = std::any::type_name::<T>(),
-            scope = %Scope::Root,
-            threading = "single-threaded",
-            factory_mode = "async",
-            "Creating async root provider"
-        );
-
-        Provider::<T> {
-            scope: Scope::Root,
-            factory: Box::new(|_| {
-                panic!(
-                    "async provider cannot be used with try_resolve/resolve; use try_resolve_async/resolve_async"
-                )
-            }),
-            async_factory: Some(Box::new(move |injector| {
-                Box::pin({
-                    let future = factory(injector);
-                    async move {
-                        #[cfg(feature = "tracing")]
-                        debug!(
-                            type_name = std::any::type_name::<T>(),
-                            scope = %Scope::Root,
-                            op = "provider_factory_call_async",
-                            "Executing async root factory"
-                        );
-                        Instance::new(future.await)
-                    }
-                })
-            })),
-            limits: Limits::default(),
-            dependency_hints: Vec::new(),
-            limiter: None,
-        }
+        Self::try_async_with_scope::<_, _, std::convert::Infallible>(Scope::Root, move |injector| {
+            let future = factory(injector);
+            async move { Ok(future.await) }
+        })
     }
 
     /// Creates a scope-scoped provider whose factory resolves asynchronously.
@@ -141,17 +54,87 @@ impl<T: ?Sized + 'static> Provider<T> {
         F: Fn(Injector) -> Fut + 'static,
         Fut: Future<Output = Shared<T>> + 'static,
     {
+        Self::try_async_with_scope::<_, _, std::convert::Infallible>(
+            Scope::Scoped,
+            move |injector| {
+                let future = factory(injector);
+                async move { Ok(future.await) }
+            },
+        )
+    }
+
+    /// Creates a singleton provider whose async factory may fail.
+    ///
+    /// An `Err` reaches the resolve call as [`ErrorKind::FactoryFailed`](crate::ErrorKind::FactoryFailed)
+    /// and nothing is cached, so the next resolve runs the factory again.
+    #[cfg(feature = "async-factory")]
+    pub fn singleton_try_async<F, Fut, E>(factory: F) -> Provider<T>
+    where
+        F: Fn(Injector) -> Fut + 'static,
+        Fut: Future<Output = Result<Shared<T>, E>> + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        Self::try_async_with_scope(Scope::Module, factory)
+    }
+
+    /// Creates a transient provider whose async factory may fail.
+    ///
+    /// An `Err` reaches the resolve call as [`ErrorKind::FactoryFailed`](crate::ErrorKind::FactoryFailed).
+    #[cfg(feature = "async-factory")]
+    pub fn transient_try_async<F, Fut, E>(factory: F) -> Provider<T>
+    where
+        F: Fn(Injector) -> Fut + 'static,
+        Fut: Future<Output = Result<Shared<T>, E>> + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        Self::try_async_with_scope(Scope::Transient, factory)
+    }
+
+    /// Creates a root-scoped provider whose async factory may fail.
+    ///
+    /// An `Err` reaches the resolve call as [`ErrorKind::FactoryFailed`](crate::ErrorKind::FactoryFailed)
+    /// and nothing is cached, so the next resolve runs the factory again.
+    #[cfg(feature = "async-factory")]
+    pub fn root_try_async<F, Fut, E>(factory: F) -> Provider<T>
+    where
+        F: Fn(Injector) -> Fut + 'static,
+        Fut: Future<Output = Result<Shared<T>, E>> + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        Self::try_async_with_scope(Scope::Root, factory)
+    }
+
+    /// Creates a scope-scoped provider whose async factory may fail.
+    ///
+    /// An `Err` reaches the resolve call as [`ErrorKind::FactoryFailed`](crate::ErrorKind::FactoryFailed)
+    /// and nothing is cached, so the next resolve runs the factory again.
+    #[cfg(feature = "async-factory")]
+    pub fn scoped_try_async<F, Fut, E>(factory: F) -> Provider<T>
+    where
+        F: Fn(Injector) -> Fut + 'static,
+        Fut: Future<Output = Result<Shared<T>, E>> + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        Self::try_async_with_scope(Scope::Scoped, factory)
+    }
+
+    fn try_async_with_scope<F, Fut, E>(scope: Scope, factory: F) -> Provider<T>
+    where
+        F: Fn(Injector) -> Fut + 'static,
+        Fut: Future<Output = Result<Shared<T>, E>> + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
         #[cfg(feature = "tracing")]
         info!(
             type_name = std::any::type_name::<T>(),
-            scope = %Scope::Scoped,
+            scope = %scope,
             threading = "single-threaded",
             factory_mode = "async",
-            "Creating async scoped provider"
+            "Creating async provider"
         );
 
         Provider::<T> {
-            scope: Scope::Scoped,
+            scope,
             factory: Box::new(|_| {
                 panic!(
                     "async provider cannot be used with try_resolve/resolve; use try_resolve_async/resolve_async"
@@ -164,11 +147,13 @@ impl<T: ?Sized + 'static> Provider<T> {
                         #[cfg(feature = "tracing")]
                         debug!(
                             type_name = std::any::type_name::<T>(),
-                            scope = %Scope::Scoped,
+                            scope = %scope,
                             op = "provider_factory_call_async",
-                            "Executing async scoped factory"
+                            "Executing async factory"
                         );
-                        Instance::new(future.await)
+                        future.await.map(Instance::new).map_err(|source| {
+                            Error::factory_failed(std::any::type_name::<T>(), source.into())
+                        })
                     }
                 })
             })),

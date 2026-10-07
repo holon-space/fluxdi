@@ -49,6 +49,7 @@ dynamic = ["thread-safe", "async-factory"]
 eager-resolution = ["thread-safe", "async-factory"]
 
 [dev-dependencies]
+anyhow = "1.0.99"
 futures = "0.3.31"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = "0.3.19"

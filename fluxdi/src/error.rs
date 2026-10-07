@@ -27,6 +27,7 @@
 //! ```
 
 use core::fmt;
+use std::sync::Arc;
 
 #[cfg(feature = "tracing")]
 use tracing::error;
@@ -35,8 +36,7 @@ use tracing::error;
 ///
 /// These variants are intentionally coarse-grained to keep error handling
 /// straightforward while still expressive enough for diagnostics.
-#[derive(Clone, PartialEq)]
-#[cfg_attr(feature = "debug", derive(Debug))]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ErrorKind {
     /// Service provider not found for the requested type.
     ServiceNotProvided,
@@ -58,16 +58,18 @@ pub enum ErrorKind {
     DynamicProviderNotFound,
     /// One or more providers failed during eager resolution.
     EagerResolutionFailed,
+    /// A fallible async factory returned an error; it is the [`Error`]'s `source()`.
+    FactoryFailed,
 }
 
 /// Container error structure.
 ///
 /// `kind` enables programmatic handling, while `message` is human-readable.
-#[derive(Clone)]
-#[cfg_attr(feature = "debug", derive(Debug))]
+#[derive(Clone, Debug)]
 pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
+    source: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl Error {
@@ -78,6 +80,7 @@ impl Error {
         let error = Self {
             kind: kind.clone(),
             message: message.into(),
+            source: None,
         };
 
         #[cfg(feature = "tracing")]
@@ -219,6 +222,19 @@ impl Error {
         )
     }
 
+    /// A fallible async factory returned `source` instead of an instance.
+    pub fn factory_failed(
+        type_name: &str,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    ) -> Self {
+        let mut error = Self::new(
+            ErrorKind::FactoryFailed,
+            format!("Factory for type {} failed: {}", type_name, source),
+        );
+        error.source = Some(Arc::from(source));
+        error
+    }
+
     /// Dependency graph validation failed.
     pub fn graph_validation_failed(details: &str) -> Self {
         Self::new(
@@ -286,8 +302,13 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "debug")]
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 #[cfg(test)]
 mod tests;
