@@ -211,15 +211,41 @@ impl Error {
         )
     }
 
-    /// One or more providers failed during eager resolution.
+    /// One or more providers failed during eager resolution; `source` is the
+    /// [`Error`]'s `source()`.
     pub fn eager_resolution_failed(provider: &str, source: &Error) -> Self {
-        Self::new(
+        let mut error = Self::new(
             ErrorKind::EagerResolutionFailed,
             format!(
                 "Eager resolution failed for provider {}: {}",
                 provider, source.message
             ),
-        )
+        );
+        error.source = Some(Arc::new(source.clone()));
+        error
+    }
+
+    /// Eager resolution wave `wave` failed; the first failure is the
+    /// [`Error`]'s `source()`, every failure is in the message.
+    #[cfg(feature = "eager-resolution")]
+    pub(crate) fn eager_wave_failed(wave: usize, failures: &[&Error]) -> Self {
+        let first = *failures
+            .first()
+            .expect("a failed wave has at least one failure");
+        let mut error = Self::new(
+            ErrorKind::EagerResolutionFailed,
+            format!(
+                "Eager resolution wave {} failed: {}",
+                wave,
+                failures
+                    .iter()
+                    .map(|failure| failure.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        );
+        error.source = Some(Arc::new(first.clone()));
+        error
     }
 
     /// A fallible async factory returned `source` instead of an instance.

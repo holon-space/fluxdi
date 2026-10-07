@@ -211,16 +211,7 @@ impl Injector {
             let errors: Vec<&Error> = results.iter().filter_map(|r| r.as_ref().err()).collect();
 
             if !errors.is_empty() {
-                let message = format!(
-                    "Eager resolution wave {} failed: {}",
-                    wave_index,
-                    errors
-                        .iter()
-                        .map(|e| e.message.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-                return Err(Error::new(ErrorKind::EagerResolutionFailed, message));
+                return Err(Error::eager_wave_failed(wave_index, &errors));
             }
         }
 

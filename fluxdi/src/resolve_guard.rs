@@ -1,6 +1,7 @@
 use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind};
 #[cfg(feature = "tracing")]
@@ -9,105 +10,143 @@ use crate::observability::EVENT_CIRCULAR_DEPENDENCY;
 #[cfg(feature = "tracing")]
 use tracing::debug;
 
-/// Key identifying a resolution scope.
+/// The resolves from a top-level resolve down to the one in progress.
 ///
-/// When running inside a tokio task (requires `lifecycle` or `resource-limit-async`
-/// feature which pulls in tokio), each task gets its own resolve set keyed by
-/// task ID. This prevents issues when the runtime migrates async tasks
-/// between worker threads.
-///
-/// Without tokio, falls back to thread ID so that each thread gets its own
-/// independent set.
-#[derive(Hash, Eq, PartialEq, Clone, Copy)]
-struct ScopeKey(u64);
+/// A type that appears twice on one path is a cycle. Concurrent sibling
+/// resolves extend their common parent path separately, so they never see
+/// each other; waits between them are the in-flight cells' concern.
+type ResolutionPath = Option<Arc<PathNode>>;
 
-impl ScopeKey {
-    fn current() -> Self {
-        // When tokio is available, use task ID for async-safe scoping.
-        // tokio::task::try_id() returns Some(Id) inside a tokio task, None outside.
-        #[cfg(feature = "lifecycle")]
-        if let Some(id) = tokio::task::try_id() {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            id.hash(&mut hasher);
-            return Self(hasher.finish());
-        }
-        // Fallback for sync contexts or when tokio is not available: use thread ID.
-        Self(thread_id_as_u64())
-    }
-}
-
-fn thread_id_as_u64() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Global resolve sets, keyed by scope (task ID or thread ID).
-///
-/// Uses a global Mutex instead of thread_local! so that guards pushed on
-/// one worker thread and dropped on another (after async task migration)
-/// still find their set. Contention is minimal: the critical section is
-/// a HashMap lookup + HashSet insert/remove.
-///
-/// Uses HashSet instead of Vec because concurrent futures within the same
-/// task (e.g. via `join_all` in eager resolution) interleave their
-/// push/drop operations in arbitrary order. A set supports unordered
-/// removal while still providing O(1) cycle detection via `contains`.
-static RESOLVE_STACKS: Mutex<Option<HashMap<ScopeKey, HashSet<TypeId>>>> = Mutex::new(None);
-
-fn with_stacks<R>(f: impl FnOnce(&mut HashMap<ScopeKey, HashSet<TypeId>>) -> R) -> R {
-    let mut guard = RESOLVE_STACKS.lock().unwrap_or_else(|e| e.into_inner());
-    let stacks = guard.get_or_insert_with(HashMap::new);
-    f(stacks)
-}
-
-pub struct ResolveGuard {
+struct PathNode {
     type_id: TypeId,
-    scope_key: ScopeKey,
+    parent: ResolutionPath,
+}
+
+thread_local! {
+    /// The path of the resolve being run on this thread.
+    static RESOLUTION_PATH: Cell<ResolutionPath> = const { Cell::new(None) };
+}
+
+fn extend_current_path(type_id: TypeId) -> Result<Arc<PathNode>, Error> {
+    let parent = crate::future_local::current(&RESOLUTION_PATH);
+    let mut ancestors = std::iter::successors(parent.as_deref(), |node| node.parent.as_deref());
+    if let Some(_cycle_length) = ancestors.position(|node| node.type_id == type_id) {
+        #[cfg(feature = "tracing")]
+        debug!(
+            event = EVENT_CIRCULAR_DEPENDENCY,
+            type_id = ?type_id,
+            cycle_length = _cycle_length + 1,
+            "Circular dependency detected during resolve"
+        );
+        return Err(Error::new(
+            ErrorKind::CircularDependency,
+            format!(
+                "Circular dependency detected while resolving type_id: {:?}",
+                type_id
+            ),
+        ));
+    }
+    Ok(Arc::new(PathNode { type_id, parent }))
+}
+
+/// Puts a synchronous resolve of `type_id` on the current path until dropped.
+///
+/// Not `Send`: it must drop on the thread, and within the poll, that pushed it.
+pub struct ResolveGuard {
+    node: Arc<PathNode>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl ResolveGuard {
     pub fn push(type_id: TypeId) -> Result<Self, Error> {
-        let scope_key = ScopeKey::current();
-
-        with_stacks(|stacks| {
-            let set = stacks.entry(scope_key).or_default();
-
-            if set.contains(&type_id) {
-                #[cfg(feature = "tracing")]
-                debug!(
-                    event = EVENT_CIRCULAR_DEPENDENCY,
-                    type_id = ?type_id,
-                    depth = set.len(),
-                    "Circular dependency detected during resolve"
-                );
-
-                return Err(Error::new(
-                    ErrorKind::CircularDependency,
-                    format!(
-                        "Circular dependency detected while resolving type_id: {:?}",
-                        type_id
-                    ),
-                ));
-            }
-
-            set.insert(type_id);
-            Ok(Self { type_id, scope_key })
+        let node = extend_current_path(type_id)?;
+        RESOLUTION_PATH.with(|path| path.set(Some(node.clone())));
+        Ok(Self {
+            node,
+            _not_send: PhantomData,
         })
     }
 }
 
 impl Drop for ResolveGuard {
     fn drop(&mut self) {
-        with_stacks(|stacks| {
-            if let Some(set) = stacks.get_mut(&self.scope_key) {
-                set.remove(&self.type_id);
-                if set.is_empty() {
-                    stacks.remove(&self.scope_key);
-                }
-            }
+        RESOLUTION_PATH.with(|path| {
+            let current = path.take();
+            assert!(
+                current.is_some_and(|current| Arc::ptr_eq(&current, &self.node)),
+                "resolve guards drop in the reverse order of their pushes"
+            );
+            path.set(self.node.parent.clone());
         });
+    }
+}
+
+/// Runs the async resolve of `type_id` on the path of the resolve that polls
+/// it first, extended by `type_id`.
+#[cfg(feature = "async-factory")]
+pub(crate) async fn resolving<R>(
+    type_id: TypeId,
+    resolve: impl std::future::Future<Output = Result<R, Error>>,
+) -> Result<R, Error> {
+    let path = extend_current_path(type_id)?;
+    crate::future_local::WithLocal::new(&RESOLUTION_PATH, path, resolve).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Error, ErrorKind, Injector, Provider, Shared};
+    use std::sync::{Arc, Mutex};
+
+    struct A;
+    struct B;
+
+    #[test]
+    fn a_sync_resolve_that_reaches_its_own_type_is_a_cycle() {
+        let inner = Arc::new(Mutex::new(None));
+        let injector = Injector::root();
+        injector.provide::<A>(Provider::transient(|inj: &Injector| {
+            inj.try_resolve::<B>().unwrap();
+            Shared::new(A)
+        }));
+        injector.provide::<B>(Provider::transient({
+            let inner = inner.clone();
+            move |inj: &Injector| {
+                *inner.lock().unwrap() = inj.try_resolve::<A>().err().map(|e| e.kind);
+                Shared::new(B)
+            }
+        }));
+
+        injector.try_resolve::<A>().unwrap();
+        assert_eq!(*inner.lock().unwrap(), Some(ErrorKind::CircularDependency));
+        assert!(
+            crate::future_local::current(&super::RESOLUTION_PATH).is_none(),
+            "the path outlived its resolves"
+        );
+    }
+
+    #[cfg(feature = "async-factory")]
+    #[test]
+    fn an_async_resolve_that_reaches_its_own_type_is_a_cycle() {
+        let injector = Injector::root();
+        injector.provide::<A>(Provider::transient_try_async(|inj: Injector| async move {
+            inj.try_resolve_async::<B>().await?;
+            Ok::<_, Error>(Shared::new(A))
+        }));
+        injector.provide::<B>(Provider::transient_try_async(|inj: Injector| async move {
+            inj.try_resolve_async::<A>().await?;
+            Ok::<_, Error>(Shared::new(B))
+        }));
+
+        let err = futures::executor::block_on(injector.try_resolve_async::<A>())
+            .err()
+            .expect("A -> B -> A resolved");
+
+        let kinds: Vec<ErrorKind> =
+            std::iter::successors(Some(&err as &(dyn std::error::Error + 'static)), |e| {
+                e.source()
+            })
+            .filter_map(|e| e.downcast_ref::<Error>().map(|e| e.kind.clone()))
+            .collect();
+        assert_eq!(kinds.last(), Some(&ErrorKind::CircularDependency), "{err}");
     }
 }

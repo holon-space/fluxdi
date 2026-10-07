@@ -6,6 +6,8 @@ pub mod axum;
 #[cfg(feature = "dynamic")]
 pub mod dynamic;
 pub mod error;
+#[cfg(feature = "async-factory")]
+mod future_local;
 pub mod graph;
 pub mod injector;
 pub mod instance;

@@ -184,6 +184,23 @@ fn eager_resolution_reports_try_async_failure() {
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
 
+#[cfg(feature = "eager-resolution")]
+#[test]
+fn eager_resolution_failure_keeps_the_factory_failure_as_its_source() {
+    let injector = Injector::root();
+    injector.provide::<String>(Provider::singleton_try_async(fails_on_first_run(Arc::new(
+        AtomicUsize::new(0),
+    ))));
+
+    let err = block_on(injector.resolve_all_eager()).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::EagerResolutionFailed);
+    let source = std::error::Error::source(&err)
+        .expect("EagerResolutionFailed keeps its source")
+        .downcast_ref::<Error>()
+        .expect("source is the failed resolve's fluxdi Error");
+    assert_factory_failed(source.clone());
+}
+
 #[test]
 fn nested_fluxdi_error_kind_is_recoverable_from_the_source() {
     let injector = Injector::root();

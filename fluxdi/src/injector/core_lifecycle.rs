@@ -6,6 +6,10 @@ impl Injector {
             inner: Shared::new(InjectorInner {
                 parent: None,
                 is_scope_boundary: false,
+                #[cfg(feature = "async-factory")]
+                scope_id: ScopeId::next(),
+                #[cfg(feature = "async-factory")]
+                cells: Shared::new(CellRegistry::default()),
                 #[cfg(not(feature = "thread-safe"))]
                 providers: Store::new(HashMap::new()),
                 #[cfg(not(feature = "thread-safe"))]
@@ -87,6 +91,10 @@ impl Injector {
             inner: Shared::new(InjectorInner {
                 parent: Some(parent.inner.clone()),
                 is_scope_boundary: false,
+                #[cfg(feature = "async-factory")]
+                scope_id: ScopeId::next(),
+                #[cfg(feature = "async-factory")]
+                cells: parent.inner.cells.clone(),
                 #[cfg(not(feature = "thread-safe"))]
                 providers: Store::new(HashMap::new()),
                 #[cfg(not(feature = "thread-safe"))]
@@ -168,6 +176,10 @@ impl Injector {
             inner: Shared::new(InjectorInner {
                 parent: Some(parent.inner.clone()),
                 is_scope_boundary: true,
+                #[cfg(feature = "async-factory")]
+                scope_id: ScopeId::next(),
+                #[cfg(feature = "async-factory")]
+                cells: parent.inner.cells.clone(),
                 #[cfg(not(feature = "thread-safe"))]
                 providers: Store::new(HashMap::new()),
                 #[cfg(not(feature = "thread-safe"))]

@@ -17,9 +17,7 @@ impl Injector {
         #[cfg(feature = "metrics")]
         let resolve_started = std::time::Instant::now();
 
-        let operation = async {
-            let _guard = ResolveGuard::push(type_id)?;
-
+        let operation = crate::resolve_guard::resolving(type_id, async {
             #[cfg(feature = "tracing")]
             trace!(
                 type_name = type_name,
@@ -53,9 +51,8 @@ impl Injector {
             self.inner.metrics.record_resolve_cache_miss();
 
             let provider = self.resolve_provider::<T>()?;
-            let instance = self.resolve_instance_async::<T>().await?;
-
-            if provider.scope == Scope::Transient {
+            let Some(target) = self.cache_target_for_scope(provider.scope) else {
+                let instance = self.resolve_instance_async::<T>().await?;
                 #[cfg(feature = "tracing")]
                 trace!(
                     type_name = type_name,
@@ -65,11 +62,22 @@ impl Injector {
                     "Resolved transient service"
                 );
                 return Ok(instance.value());
-            }
+            };
 
-            if let Some(target) = self.cache_target_for_scope(provider.scope) {
-                target.store_instance::<T>(instance.clone());
-            }
+            let instance = self
+                .resolve_in_cell(
+                    CellKey::new(&target, BindingKey::Single(type_id)),
+                    || self.get_instance::<T>(),
+                    || {
+                        let (injector, target) = (self.clone(), target.clone());
+                        Box::pin(async move {
+                            let instance = injector.resolve_instance_async::<T>().await?;
+                            target.store_instance::<T>(instance.clone());
+                            Ok(instance)
+                        }) as RunFuture<T>
+                    },
+                )
+                .await?;
 
             #[cfg(feature = "tracing")]
             trace!(
@@ -81,7 +89,7 @@ impl Injector {
             );
 
             Ok(instance.value())
-        };
+        });
 
         #[cfg(feature = "tracing")]
         let result = {
@@ -123,9 +131,7 @@ impl Injector {
         #[cfg(feature = "metrics")]
         let resolve_started = std::time::Instant::now();
 
-        let operation = async {
-            let _guard = ResolveGuard::push(type_id)?;
-
+        let operation = crate::resolve_guard::resolving(type_id, async {
             #[cfg(feature = "tracing")]
             trace!(
                 type_name = type_name,
@@ -170,19 +176,39 @@ impl Injector {
                     self.inner.metrics.record_resolve_cache_miss();
                 }
 
-                let instance = self
-                    .resolve_instance_from_provider_async::<T>(&provider)
-                    .await?;
-
-                if let Some(target) = cache_target {
-                    target.store_set_instance::<T>(&provider, instance.clone());
-                }
+                let instance = match cache_target {
+                    None => {
+                        self.resolve_instance_from_provider_async::<T>(&provider)
+                            .await?
+                    }
+                    Some(target) => {
+                        self.resolve_in_cell(
+                            CellKey::new(
+                                &target,
+                                BindingKey::SetMember(SetProviderKey::of::<T>(&provider)),
+                            ),
+                            || target.get_set_instance::<T>(&provider),
+                            || {
+                                let (injector, provider, target) =
+                                    (self.clone(), provider.clone(), target.clone());
+                                Box::pin(async move {
+                                    let instance = injector
+                                        .resolve_instance_from_provider_async::<T>(&provider)
+                                        .await?;
+                                    target.store_set_instance::<T>(&provider, instance.clone());
+                                    Ok(instance)
+                                }) as RunFuture<T>
+                            },
+                        )
+                        .await?
+                    }
+                };
 
                 values.push(instance.value());
             }
 
             Ok(values)
-        };
+        });
 
         #[cfg(feature = "tracing")]
         let result = {
@@ -224,9 +250,7 @@ impl Injector {
         #[cfg(feature = "metrics")]
         let resolve_started = std::time::Instant::now();
 
-        let operation = async {
-            let _guard = ResolveGuard::push(type_id)?;
-
+        let operation = crate::resolve_guard::resolving(type_id, async {
             #[cfg(feature = "tracing")]
             trace!(
                 type_name = type_name,
@@ -263,9 +287,8 @@ impl Injector {
             self.inner.metrics.record_resolve_cache_miss();
 
             let provider = self.resolve_provider_named::<T>(name)?;
-            let instance = self.resolve_instance_named_async::<T>(name).await?;
-
-            if provider.scope == Scope::Transient {
+            let Some(target) = self.cache_target_for_scope(provider.scope) else {
+                let instance = self.resolve_instance_named_async::<T>(name).await?;
                 #[cfg(feature = "tracing")]
                 trace!(
                     type_name = type_name,
@@ -276,11 +299,24 @@ impl Injector {
                     "Resolved named transient service"
                 );
                 return Ok(instance.value());
-            }
+            };
 
-            if let Some(target) = self.cache_target_for_scope(provider.scope) {
-                target.store_instance_named::<T>(name, instance.clone());
-            }
+            let instance = self
+                .resolve_in_cell(
+                    CellKey::new(&target, BindingKey::Named(NamedTypeKey::of::<T>(name))),
+                    || self.get_instance_named::<T>(name),
+                    || {
+                        let (injector, name, target) =
+                            (self.clone(), name.to_string(), target.clone());
+                        Box::pin(async move {
+                            let instance =
+                                injector.resolve_instance_named_async::<T>(&name).await?;
+                            target.store_instance_named::<T>(&name, instance.clone());
+                            Ok(instance)
+                        }) as RunFuture<T>
+                    },
+                )
+                .await?;
 
             #[cfg(feature = "tracing")]
             trace!(
@@ -293,7 +329,7 @@ impl Injector {
             );
 
             Ok(instance.value())
-        };
+        });
 
         #[cfg(feature = "tracing")]
         let result = {

@@ -7,8 +7,6 @@ use dashmap::{DashMap, mapref::entry::Entry as DashEntry};
 #[cfg(feature = "dynamic")]
 use crate::dynamic::DynamicProvider;
 use crate::error::Error;
-#[cfg(feature = "eager-resolution")]
-use crate::error::ErrorKind;
 #[cfg(feature = "dynamic")]
 use crate::graph::DynamicProviderGraphMeta;
 use crate::graph::{
@@ -26,6 +24,9 @@ use crate::runtime::Shared;
 #[cfg(not(all(feature = "thread-safe", feature = "lock-free")))]
 use crate::runtime::Store;
 use crate::scope::Scope;
+
+#[cfg(feature = "async-factory")]
+use cells::{BindingKey, CellKey, CellRegistry, RunFuture, ScopeId};
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, info_span, trace};
@@ -158,6 +159,10 @@ fn detect_cycles(
 struct InjectorInner {
     pub(crate) parent: Option<Shared<InjectorInner>>,
     pub(crate) is_scope_boundary: bool,
+    #[cfg(feature = "async-factory")]
+    pub(crate) scope_id: ScopeId,
+    #[cfg(feature = "async-factory")]
+    pub(crate) cells: Shared<CellRegistry>,
 
     #[cfg(not(feature = "thread-safe"))]
     pub(crate) providers: Store<HashMap<TypeId, Shared<dyn Any>>>,
@@ -244,6 +249,8 @@ impl std::fmt::Debug for InjectorInner {
         let mut ds = f.debug_struct("InjectorInner");
         ds.field("parent", &self.parent.is_some());
         ds.field("is_scope_boundary", &self.is_scope_boundary);
+        #[cfg(feature = "async-factory")]
+        ds.field("scope_id", &self.scope_id);
         ds.field("providers", &self.providers);
         ds.field("graph_providers", &self.graph_providers);
         ds.field("set_providers", &self.set_providers);
@@ -278,6 +285,8 @@ impl Clone for Injector {
 
 #[cfg(all(test, feature = "async-factory"))]
 mod async_factory_tests;
+#[cfg(feature = "async-factory")]
+mod cells;
 mod core_lifecycle;
 #[cfg(all(test, feature = "dynamic"))]
 mod dynamic_tests;
@@ -287,6 +296,8 @@ mod eager_resolution_tests;
 mod fallible_async_factory_tests;
 mod graph_state;
 mod graph_validation;
+#[cfg(all(test, feature = "async-factory"))]
+mod in_flight_cell_tests;
 
 #[cfg(not(feature = "thread-safe"))]
 mod nts_instance_factory;
