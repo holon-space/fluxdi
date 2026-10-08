@@ -76,16 +76,14 @@ impl Injector {
             info_span!(SPAN_PROVIDE, type_name = type_name, scope = %scope, op = "provide_set")
                 .entered();
 
-        let result = match scope {
-            Scope::Root => {
-                let root = self.root_injector();
-                root.store_set_provider::<T>(provider)
-            }
-
-            Scope::Module | Scope::Scoped | Scope::Transient => {
-                self.store_set_provider::<T>(provider)
-            }
+        let store = match scope {
+            Scope::Root => self.root_injector(),
+            Scope::Module | Scope::Scoped | Scope::Transient => self.clone(),
         };
+        #[cfg(feature = "live")]
+        let result = store.store_set_provider_live::<T>(provider);
+        #[cfg(not(feature = "live"))]
+        let result = store.store_set_provider::<T>(provider).map(drop);
 
         #[cfg(feature = "tracing")]
         match &result {

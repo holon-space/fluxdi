@@ -10,6 +10,11 @@
 //! Each generation of a cell has its own producer. A new generation starts
 //! only when the newest one is terminal, and never after `shutdown_live`;
 //! both checks and the producer's record are made under the producers lock.
+//!
+//! A live set is observed from then on: a member registered later gets the
+//! next slot in every live set that sees it. Creating a set and registering a
+//! member both hold the sets lock, so a member is never in neither and never
+//! twice.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, MutexGuard, OnceLock, Weak};
@@ -31,11 +36,13 @@ use crate::live::{
 type Publish<T> = Shared<watch::Sender<CellState<T>>>;
 type CachedLookup<T> = Box<dyn Fn(&Injector) -> Option<Shared<Instance<T>>> + Send + Sync>;
 type Produce<T> = Box<dyn Fn(Injector, Injector, LivePublisher<T>) -> RunFuture<T> + Send + Sync>;
+type Membership<T> = Shared<watch::Sender<Vec<Live<T>>>>;
 
 /// The live part of a [`CellRegistry`].
 pub(crate) struct LiveCells {
     runtime: OnceLock<Handle>,
     cells: Mutex<HashMap<CellKey, LiveEntry>>,
+    sets: Mutex<HashMap<TypeId, Vec<LiveSetEntry>>>,
     producers: Mutex<Producers>,
     /// Counts producer starts and ends.
     report: watch::Sender<u64>,
@@ -46,6 +53,7 @@ impl Default for LiveCells {
         Self {
             runtime: OnceLock::new(),
             cells: Mutex::new(HashMap::new()),
+            sets: Mutex::new(HashMap::new()),
             producers: Mutex::new(Producers::default()),
             report: watch::channel(0).0,
         }
@@ -69,6 +77,34 @@ impl LiveEntry {
             .downcast_ref::<Publish<T>>()
             .expect("a live cell key maps to one value type")
     }
+}
+
+/// The live set of one value type resolved from one injector.
+struct LiveSetEntry {
+    resolver: Weak<InjectorInner>,
+    /// The resolver and its ancestors: a member registered in any of them
+    /// is a member of this set.
+    lineage: Vec<ScopeId>,
+    /// `Membership<T>` for the entry's `T`.
+    membership: Box<dyn Any + Send + Sync>,
+}
+
+impl LiveSetEntry {
+    fn membership<T: ?Sized + Send + Sync + 'static>(&self) -> &Membership<T> {
+        self.membership
+            .downcast_ref::<Membership<T>>()
+            .expect("a live set entry maps to one value type")
+    }
+}
+
+/// What a cell that would start a producer after `shutdown_live` does.
+#[derive(Clone, Copy)]
+enum AfterShutdown {
+    /// The resolve fails.
+    Refuse,
+    /// The cell is created `Failed(LiveProducerCancelled)`, like the cells
+    /// the shutdown cancelled.
+    Cancelled,
 }
 
 struct ProducerRecord {
@@ -390,6 +426,7 @@ impl Injector {
             key,
             None,
             &target,
+            AfterShutdown::Refuse,
             |target: &Injector| target.get_instance::<T>(),
             |injector: Injector, target: Injector, publisher: LivePublisher<T>| {
                 Box::pin(async move {
@@ -415,11 +452,24 @@ impl Injector {
 
     /// Returns the set of `T` at once, one slot per registered member, and
     /// starts the producer of every member that is not cached or running.
+    /// A member registered later, in this injector or an ancestor, gets the
+    /// next slot and its producer starts; see [`LiveSet`]. A set with no
+    /// members yet is empty, not an error.
     pub fn try_resolve_all_live<T>(&self) -> Result<LiveSet<T>, Error>
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let providers = self.resolve_set_providers::<T>()?;
+        let registry = &self.inner.cells;
+        let mut sets = registry.live.sets.lock().expect("live set mutex poisoned");
+        let entries = sets.entry(TypeId::of::<T>()).or_default();
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.lineage[0] == self.inner.scope_id)
+        {
+            return Ok(LiveSet::new(entry.membership::<T>().clone()));
+        }
+        let mut providers = Vec::new();
+        self.collect_set_providers::<T>(&mut providers)?;
         let targets = providers
             .iter()
             .map(|provider| self.live_cache_target::<T>(provider.scope))
@@ -429,33 +479,98 @@ impl Injector {
             .zip(targets)
             .enumerate()
             .map(|(member, (provider, target))| {
-                let key = CellKey::new(
-                    &target,
-                    BindingKey::SetMember(SetProviderKey::of::<T>(&provider)),
-                );
-                let cached_provider = provider.clone();
-                self.live_cell(
-                    key,
-                    Some(member),
-                    &target,
-                    move |target: &Injector| target.get_set_instance::<T>(&cached_provider),
-                    move |injector: Injector, target: Injector, publisher: LivePublisher<T>| {
-                        let provider = provider.clone();
-                        Box::pin(async move {
-                            let instance = injector
-                                .resolve_instance_from_provider_async_with::<T>(
-                                    &provider,
-                                    |provider, injector| provider.live_run(injector, publisher),
-                                )
-                                .await?;
-                            target.store_set_instance::<T>(&provider, instance.clone());
-                            Ok(instance)
-                        }) as RunFuture<T>
-                    },
-                )
+                self.live_set_member(member, provider, &target, AfterShutdown::Refuse)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(LiveSet::new(members))
+        let membership: Membership<T> = Shared::new(watch::channel(members).0);
+        entries.push(LiveSetEntry {
+            resolver: Shared::downgrade(&self.inner),
+            lineage: std::iter::successors(Some(&self.inner), |inner| inner.parent.as_ref())
+                .map(|inner| inner.scope_id)
+                .collect(),
+            membership: Box::new(membership.clone()),
+        });
+        Ok(LiveSet::new(membership))
+    }
+
+    /// Stores a set member in this injector and gives it the next slot in
+    /// every live set that sees it. When such a set could not start the
+    /// member, nothing is stored.
+    pub(super) fn store_set_provider_live<T>(&self, provider: Provider<T>) -> Result<(), Error>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        let type_name = std::any::type_name::<T>();
+        let registry = &self.inner.cells;
+        let mut sets = registry.live.sets.lock().expect("live set mutex poisoned");
+        let mut observers = Vec::new();
+        if let Some(entries) = sets.get_mut(&TypeId::of::<T>()) {
+            entries.retain(|entry| {
+                let Some(inner) = entry.resolver.upgrade() else {
+                    return false;
+                };
+                if entry.lineage.contains(&self.inner.scope_id) {
+                    observers.push((Injector { inner }, entry.membership::<T>().clone()));
+                }
+                true
+            });
+        }
+        let targets = observers
+            .iter()
+            .map(|(resolver, _)| resolver.live_cache_target::<T>(provider.scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !observers.is_empty() {
+            registry.live.runtime(type_name)?;
+        }
+        let provider = self.store_set_provider::<T>(provider)?;
+        for ((resolver, membership), target) in observers.into_iter().zip(targets) {
+            let slot = membership.borrow().len();
+            let member = resolver
+                .live_set_member(slot, provider.clone(), &target, AfterShutdown::Cancelled)
+                .expect(
+                    "the cache target and the runtime were checked before the member was stored",
+                );
+            membership.send_modify(|members| members.push(member));
+        }
+        Ok(())
+    }
+
+    /// The live cell of set member `provider` in slot `member`.
+    fn live_set_member<T>(
+        &self,
+        member: usize,
+        provider: Shared<Provider<T>>,
+        target: &Injector,
+        after_shutdown: AfterShutdown,
+    ) -> Result<Live<T>, Error>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
+        let key = CellKey::new(
+            target,
+            BindingKey::SetMember(SetProviderKey::of::<T>(&provider)),
+        );
+        let cached_provider = provider.clone();
+        self.live_cell(
+            key,
+            Some(member),
+            target,
+            after_shutdown,
+            move |target: &Injector| target.get_set_instance::<T>(&cached_provider),
+            move |injector: Injector, target: Injector, publisher: LivePublisher<T>| {
+                let provider = provider.clone();
+                Box::pin(async move {
+                    let instance = injector
+                        .resolve_instance_from_provider_async_with::<T>(
+                            &provider,
+                            |provider, injector| provider.live_run(injector, publisher),
+                        )
+                        .await?;
+                    target.store_set_instance::<T>(&provider, instance.clone());
+                    Ok(instance)
+                }) as RunFuture<T>
+            },
+        )
     }
 
     pub fn resolve_all_live<T>(&self) -> LiveSet<T>
@@ -509,6 +624,7 @@ impl Injector {
         key: CellKey,
         member: Option<usize>,
         target: &Injector,
+        after_shutdown: AfterShutdown,
         cached: impl Fn(&Injector) -> Option<Shared<Instance<T>>> + Send + Sync + 'static,
         produce: impl Fn(Injector, Injector, LivePublisher<T>) -> RunFuture<T> + Send + Sync + 'static,
     ) -> Result<Live<T>, Error>
@@ -526,12 +642,23 @@ impl Injector {
             Some(entry) => (entry.publish::<T>().clone(), None),
             None => {
                 let producer = RunRef::next(type_name);
-                let (initial, start) = match cached(target) {
-                    Some(instance) => (LiveState::Ready(instance.value()), None),
+                // A cell without a producer is not entered in `cells`: a hard
+                // resolve then runs the factory itself instead of following it.
+                let (initial, start, observed) = match cached(target) {
+                    Some(instance) => (LiveState::Ready(instance.value()), None, true),
                     None => {
                         let runtime = registry.live.runtime(type_name)?;
-                        let producers = registry.live.producers_for_start(type_name)?;
-                        (LiveState::Pending, Some((runtime, producers, producer)))
+                        match (registry.live.producers_for_start(type_name), after_shutdown) {
+                            (Ok(producers), _) => (
+                                LiveState::Pending,
+                                Some((runtime, producers, producer)),
+                                true,
+                            ),
+                            (Err(error), AfterShutdown::Cancelled) => {
+                                (LiveState::Failed(error), None, false)
+                            }
+                            (Err(error), AfterShutdown::Refuse) => return Err(error),
+                        }
                     }
                 };
                 let state: Publish<T> = Shared::new(
@@ -542,12 +669,14 @@ impl Injector {
                     })
                     .0,
                 );
-                cells.insert(
-                    key.clone(),
-                    LiveEntry {
-                        state: Box::new(state.clone()),
-                    },
-                );
+                if observed {
+                    cells.insert(
+                        key.clone(),
+                        LiveEntry {
+                            state: Box::new(state.clone()),
+                        },
+                    );
+                }
                 (state, start)
             }
         };

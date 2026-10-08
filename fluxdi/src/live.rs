@@ -122,17 +122,41 @@ pub struct LivePublisher<T: ?Sized + 'static> {
     /// `None` when no live cell observes the run, as in a hard resolve that
     /// started it.
     cell: Option<(Shared<watch::Sender<CellState<T>>>, Generation)>,
+    /// The provider's decorators, applied to each partial.
+    decorate: Option<Decorate<T>>,
 }
+
+type Decorate<T> = Shared<dyn Fn(Shared<T>) -> Shared<T> + Send + Sync>;
 
 impl<T: ?Sized + 'static> LivePublisher<T> {
     pub(crate) fn new(cell: Shared<watch::Sender<CellState<T>>>, generation: Generation) -> Self {
         Self {
             cell: Some((cell, generation)),
+            decorate: None,
         }
     }
 
     pub(crate) fn unobserved() -> Self {
-        Self { cell: None }
+        Self {
+            cell: None,
+            decorate: None,
+        }
+    }
+
+    /// This publisher with `decorator` applied to each partial before the
+    /// decorators it already applies.
+    pub(crate) fn decorated<F>(self, decorator: Shared<F>) -> Self
+    where
+        F: Fn(Shared<T>) -> Shared<T> + Send + Sync + 'static,
+    {
+        let decorate: Decorate<T> = match self.decorate {
+            None => decorator,
+            Some(outer) => Shared::new(move |value| outer(decorator(value))),
+        };
+        Self {
+            cell: self.cell,
+            decorate: Some(decorate),
+        }
     }
 
     /// Publishes `value` as the `Partial` state of this publisher's
@@ -140,6 +164,10 @@ impl<T: ?Sized + 'static> LivePublisher<T> {
     pub fn partial(&self, value: Shared<T>) {
         let Some((cell, generation)) = &self.cell else {
             return;
+        };
+        let value = match &self.decorate {
+            Some(decorate) => decorate(value),
+            None => value,
         };
         let mut newest = *generation;
         let mut ended = false;
@@ -227,31 +255,61 @@ impl<T: ?Sized + Send + Sync + 'static> Live<T> {
     }
 }
 
-/// Handle to a set of live dependencies, one slot per registered member in
-/// registration order.
+/// Handle to a set of live dependencies, one slot per registered member.
+///
+/// The set grows: a member registered after the set was first resolved gets
+/// the next slot, and its producer starts. A slot is never removed or
+/// moved, so a slot index names one member for good. Slot order is the order
+/// in which the set first saw each member, which is not always the order of
+/// [`Injector::try_resolve_all_async`](crate::Injector::try_resolve_all_async).
 pub struct LiveSet<T: ?Sized + 'static> {
-    members: Vec<Live<T>>,
+    /// Every slot of the set, shared with the registry, which appends.
+    membership: Shared<watch::Sender<Vec<Live<T>>>>,
+    slots: watch::Receiver<Vec<Live<T>>>,
+    /// The slots this handle has seen, each with the last state it saw.
+    seen: Vec<Live<T>>,
 }
 
 impl<T: ?Sized + 'static> Clone for LiveSet<T> {
     fn clone(&self) -> Self {
         Self {
-            members: self.members.clone(),
+            membership: self.membership.clone(),
+            slots: self.slots.clone(),
+            seen: self.seen.clone(),
         }
     }
 }
 
 impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
-    pub(crate) fn new(members: Vec<Live<T>>) -> Self {
-        Self { members }
+    pub(crate) fn new(membership: Shared<watch::Sender<Vec<Live<T>>>>) -> Self {
+        let mut slots = membership.subscribe();
+        let seen = slots
+            .borrow_and_update()
+            .iter()
+            .map(|member| {
+                let mut member = member.clone();
+                member.watch.rx.borrow_and_update();
+                member
+            })
+            .collect();
+        Self {
+            membership,
+            slots,
+            seen,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Live<T>> {
+        self.slots.borrow().clone()
     }
 
     pub fn members(&self) -> Vec<Generational<LiveState<T>>> {
-        self.members.iter().map(Live::state).collect()
+        self.slots.borrow().iter().map(Live::state).collect()
     }
 
     pub fn ready_members(&self) -> Vec<Generational<Shared<T>>> {
-        self.members
+        self.slots
+            .borrow()
             .iter()
             .filter_map(|member| {
                 let state = member.state();
@@ -263,41 +321,61 @@ impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
             .collect()
     }
 
-    /// Waits for the next change of any member after the last states this
-    /// handle saw, and returns every member's state.
+    /// Waits for the next change after the last states this handle saw: a
+    /// member's state, or a new slot (which starts in generation 1). Returns
+    /// every slot's state.
     pub async fn changed(&mut self) -> Vec<Generational<LiveState<T>>> {
-        if self.members.is_empty() {
-            return std::future::pending().await;
+        if self.seen.is_empty() {
+            self.slots
+                .changed()
+                .await
+                .expect("a live set holds its membership sender");
+        } else {
+            let grown = Box::pin(self.slots.changed());
+            let changes = futures::future::select_all(
+                self.seen
+                    .iter_mut()
+                    .map(|member| Box::pin(member.watch.rx.changed())),
+            );
+            match futures::future::select(grown, changes).await {
+                futures::future::Either::Left((grown, _)) => {
+                    grown.expect("a live set holds its membership sender")
+                }
+                futures::future::Either::Right(((changed, _, _), _)) => {
+                    changed.expect("the registry keeps a live cell's sender")
+                }
+            }
         }
-        let changes = self
-            .members
-            .iter_mut()
-            .map(|member| Box::pin(member.watch.rx.changed()));
-        futures::future::select_all(changes)
-            .await
-            .0
-            .expect("the registry keeps a live cell's sender");
-        self.members
+        let slots = self.slots.borrow_and_update().clone();
+        self.seen.extend(slots.into_iter().skip(self.seen.len()));
+        self.seen
             .iter_mut()
             .map(|member| member.watch.rx.borrow_and_update().observed())
             .collect()
     }
 
-    /// Waits until every member's newest generation is terminal. Fails with
-    /// the first failed member's error, in registration order.
-    pub async fn complete(&self) -> Result<Vec<Generational<Shared<T>>>, Error> {
-        let mut outcomes = Vec::with_capacity(self.members.len());
-        for member in &self.members {
-            outcomes.push(member.watch.settle(false).await);
+    /// Waits until the newest generation of every slot present at the call
+    /// is terminal; a slot added meanwhile is not waited for. Fails with the
+    /// first failed member's error, in slot order.
+    pub fn complete(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Generational<Shared<T>>>, Error>> + Send + 'static {
+        let members = self.snapshot();
+        async move {
+            let mut outcomes = Vec::with_capacity(members.len());
+            for member in &members {
+                outcomes.push(member.watch.settle(false).await);
+            }
+            outcomes.into_iter().collect()
         }
-        outcomes.into_iter().collect()
     }
 
     /// [`Live::restart`] for the member in `slot`; the slot keeps its place.
     /// Fails with `LiveSlotOutOfRange` when the set has no such slot.
     pub fn restart(&self, slot: usize) -> Result<Generation, Error> {
-        let member = self.members.get(slot).ok_or_else(|| {
-            Error::live_slot_out_of_range(std::any::type_name::<T>(), slot, self.members.len())
+        let members = self.snapshot();
+        let member = members.get(slot).ok_or_else(|| {
+            Error::live_slot_out_of_range(std::any::type_name::<T>(), slot, members.len())
         })?;
         member.restart()
     }

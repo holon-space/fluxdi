@@ -5,8 +5,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
-use crate::live::{Completeness, Generational, LivePublisher};
-use crate::{Error, ErrorKind, Injector, LiveOutcome, LiveState, Provider, Shared};
+use crate::live::{Generational, LivePublisher};
+use crate::{Completeness, Error, ErrorKind, Injector, LiveOutcome, LiveState, Provider, Shared};
 
 const HANG: Duration = Duration::from_secs(5);
 
@@ -628,6 +628,11 @@ async fn shutdown_live_ends_live_production_for_good() {
         .err()
         .expect("started a producer after shutdown_live");
     assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+    let hard = timeout(HANG, injector.try_resolve_async::<String>())
+        .await
+        .unwrap()
+        .expect("a refused live resolve broke the hard resolve");
+    assert_eq!(*hard, "never started");
     assert_eq!(injector.live_report().len(), 1);
     let cached = injector.try_resolve_live::<u32>().unwrap();
     assert_eq!(label(&cached.state()), (1, "ready"));
@@ -948,4 +953,368 @@ async fn a_publish_after_the_producer_ended_is_a_programming_error() {
         assert!(panic_text(panic).contains("ended"));
         assert_eq!(label(&live.state()), before);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decorators_wrap_partials_and_values_of_a_live_provider() {
+    let gate = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide::<String>(
+        Provider::root_live({
+            let gate = gate.clone();
+            move |_, publisher: LivePublisher<String>| {
+                let gate = gate.clone();
+                async move {
+                    publisher.partial(Shared::new("page".to_string()));
+                    gate.notified().await;
+                    Ok::<_, std::io::Error>(Shared::new("complete".to_string()))
+                }
+            }
+        })
+        .with_decorator(|inner| Shared::new(format!("[{inner}]")))
+        .with_decorator(|inner| Shared::new(format!("({inner})"))),
+    );
+
+    let mut live = injector.resolve_live::<String>();
+    let partial = timeout(HANG, async {
+        loop {
+            if let LiveState::Partial(value) = live.state().value {
+                return value;
+            }
+            live.changed().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(partial.as_str(), "([page])");
+
+    gate.notify_one();
+    let ready = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    assert_eq!(ready.value.as_str(), "([complete])");
+    let hard = injector.try_resolve_async::<String>().await.unwrap();
+    assert_eq!(hard.as_str(), "([complete])");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decorator_wraps_a_live_provider_resolved_hard() {
+    let injector = Injector::root();
+    injector.provide::<String>(
+        Provider::root_live(|_, _: LivePublisher<String>| async {
+            Ok::<_, std::io::Error>(Shared::new("complete".to_string()))
+        })
+        .with_decorator(|inner| Shared::new(format!("[{inner}]"))),
+    );
+
+    let hard = injector.try_resolve_async::<String>().await.unwrap();
+    assert_eq!(hard.as_str(), "[complete]");
+}
+
+fn ready_source(name: &'static str) -> Provider<dyn Source> {
+    Provider::root_async(
+        move |_| async move { Shared::new(NamedSource(name)) as Shared<dyn Source> },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_provided_after_the_set_resolves_gets_a_slot_and_starts() {
+    let gates: Vec<Arc<Notify>> = (0..3).map(|_| Arc::new(Notify::new())).collect();
+    let injector = Injector::root();
+    for (name, gate) in ["org", "loro"].into_iter().zip(&gates) {
+        injector.provide_into_set::<dyn Source>(gated_source(name, gate.clone()));
+    }
+    let mut set = injector.resolve_all_live::<dyn Source>();
+    assert_eq!(set.members().len(), 2);
+
+    injector.provide_into_set::<dyn Source>(gated_source("mcp", gates[2].clone()));
+    let members = timeout(HANG, set.changed())
+        .await
+        .expect("the subscriber did not see the new slot");
+    assert_eq!(
+        members.iter().map(label).collect::<Vec<_>>(),
+        vec![(1, "pending"); 3]
+    );
+    assert_eq!(set.members().len(), 3);
+
+    gates[2].notify_one();
+    let members = timeout(HANG, set.changed()).await.unwrap();
+    assert_eq!(
+        members.iter().map(label).collect::<Vec<_>>(),
+        vec![(1, "pending"), (1, "pending"), (1, "ready")]
+    );
+    let names: Vec<&str> = set.ready_members().iter().map(|s| s.value.name()).collect();
+    assert_eq!(names, vec!["mcp"]);
+    assert!(
+        injector
+            .live_report()
+            .iter()
+            .any(|timing| timing.member == Some(2))
+    );
+
+    gates[0].notify_one();
+    gates[1].notify_one();
+    let names: Vec<&str> = timeout(HANG, set.complete())
+        .await
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|member| member.value.name())
+        .collect();
+    assert_eq!(names, vec!["org", "loro", "mcp"]);
+    let hard = injector
+        .try_resolve_all_async::<dyn Source>()
+        .await
+        .unwrap();
+    assert_eq!(hard.len(), 3);
+    assert_eq!(injector.resolve_all_live::<dyn Source>().members().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_slot_restarts_in_place() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(ready_source("org"));
+    let set = injector.resolve_all_live::<dyn Source>();
+    injector.provide_into_set::<dyn Source>(Provider::root_try_async({
+        let runs = runs.clone();
+        move |_| {
+            let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if run == 1 {
+                    return Err(std::io::Error::other("mcp unreachable"));
+                }
+                Ok::<_, std::io::Error>(Shared::new(NamedSource("mcp")) as Shared<dyn Source>)
+            }
+        }
+    }));
+    timeout(HANG, set.complete()).await.unwrap().unwrap_err();
+    assert_eq!(
+        set.members().iter().map(label).collect::<Vec<_>>(),
+        vec![(1, "ready"), (1, "failed")]
+    );
+
+    assert_eq!(set.restart(1).unwrap().get(), 2);
+    let members = timeout(HANG, set.complete()).await.unwrap().unwrap();
+    let names: Vec<(u64, &str)> = members
+        .iter()
+        .map(|member| (member.generation.get(), member.value.name()))
+        .collect();
+    assert_eq!(names, vec![(1, "org"), (2, "mcp")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_covers_the_slots_present_when_it_is_called() {
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(ready_source("org"));
+    let set = injector.resolve_all_live::<dyn Source>();
+    let complete = set.complete();
+
+    injector.provide_into_set::<dyn Source>(gated_source("mcp", Arc::new(Notify::new())));
+    assert_eq!(timeout(HANG, complete).await.unwrap().unwrap().len(), 1);
+    assert!(
+        timeout(Duration::from_millis(50), set.complete())
+            .await
+            .is_err(),
+        "complete() returned before the late member was terminal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_provided_after_shutdown_live_gets_a_cancelled_slot() {
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(ready_source("org"));
+    let mut set = injector.resolve_all_live::<dyn Source>();
+    timeout(HANG, set.complete()).await.unwrap().unwrap();
+    injector.shutdown_live();
+    let producers = injector.live_report().len();
+
+    injector.provide_into_set::<dyn Source>(ready_source("mcp"));
+    let members = timeout(HANG, async {
+        loop {
+            let members = set.changed().await;
+            if members.len() == 2 {
+                return members;
+            }
+        }
+    })
+    .await
+    .expect("the subscriber did not see the new slot");
+    assert_eq!(
+        members.iter().map(label).collect::<Vec<_>>(),
+        vec![(1, "ready"), (1, "failed")]
+    );
+    let LiveState::Failed(error) = &members[1].value else {
+        unreachable!("checked above")
+    };
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+    let error = set.restart(1).expect_err("restarted after shutdown_live");
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+    assert_eq!(injector.live_report().len(), producers);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_provided_after_shutdown_live_resolves_hard_as_without_a_live_set() {
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(ready_source("org"));
+    let set = injector.resolve_all_live::<dyn Source>();
+    timeout(HANG, set.complete()).await.unwrap().unwrap();
+    injector.shutdown_live();
+    injector.provide_into_set::<dyn Source>(ready_source("mcp"));
+    assert_eq!(label(&set.members()[1]), (1, "failed"));
+
+    for _ in 0..2 {
+        let hard = timeout(HANG, injector.try_resolve_all_async::<dyn Source>())
+            .await
+            .expect("a hard resolve after shutdown hung")
+            .expect("a member added after shutdown_live broke the hard set resolve");
+        let names: Vec<&str> = hard.iter().map(|source| source.name()).collect();
+        assert_eq!(names, vec!["org", "mcp"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_live_set_grows_from_its_first_member() {
+    let injector = Injector::root();
+    let mut set = injector
+        .try_resolve_all_live::<dyn Source>()
+        .expect("a live set of no members was refused");
+    assert!(set.members().is_empty());
+    let complete = timeout(HANG, set.complete())
+        .await
+        .expect("complete() on an empty set waited")
+        .unwrap();
+    assert!(complete.is_empty());
+    assert!(
+        timeout(Duration::from_millis(50), set.changed())
+            .await
+            .is_err(),
+        "changed() on an empty set returned without a new slot"
+    );
+    let hard = injector
+        .try_resolve_all_async::<dyn Source>()
+        .await
+        .expect_err("a hard resolve of no members succeeded");
+    assert_eq!(hard.kind, ErrorKind::ServiceNotProvided);
+
+    injector.provide_into_set::<dyn Source>(ready_source("mcp"));
+    let members = timeout(HANG, set.changed())
+        .await
+        .expect("the subscriber did not see the first slot");
+    assert_eq!(members.len(), 1);
+    let names: Vec<&str> = timeout(HANG, set.complete())
+        .await
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|member| member.value.name())
+        .collect();
+    assert_eq!(names, vec!["mcp"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transient_member_cannot_join_an_observed_set() {
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(ready_source("org"));
+    let set = injector.resolve_all_live::<dyn Source>();
+
+    let error = injector
+        .try_provide_into_set::<dyn Source>(Provider::transient(|_| {
+            Shared::new(NamedSource("scratch")) as Shared<dyn Source>
+        }))
+        .expect_err("a transient member joined a live set");
+    assert_eq!(error.kind, ErrorKind::LiveRequiresCachedScope);
+    assert_eq!(set.members().len(), 1);
+    let hard = injector
+        .try_resolve_all_async::<dyn Source>()
+        .await
+        .unwrap();
+    assert_eq!(hard.len(), 1);
+}
+
+#[test]
+fn concurrent_registrations_while_sets_resolve_and_follow_lose_no_slot() {
+    const REGISTRARS: usize = 4;
+    const PER_REGISTRAR: usize = 32;
+    const RESOLVERS: usize = 4;
+    const SCOPES_PER_RESOLVER: usize = 8;
+    const MEMBERS: usize = 1 + REGISTRARS * PER_REGISTRAR;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let injector = Injector::root_with_runtime(runtime.handle().clone());
+    injector.provide_into_set::<dyn Source>(ready_source("first"));
+    let mut followed = injector.resolve_all_live::<dyn Source>();
+    let follower = runtime.spawn(async move {
+        loop {
+            let members = followed.changed().await;
+            let ready = members
+                .iter()
+                .filter(|member| matches!(member.value, LiveState::Ready(_)))
+                .count();
+            if ready == MEMBERS {
+                return members.len();
+            }
+        }
+    });
+
+    let start = Arc::new(std::sync::Barrier::new(REGISTRARS + RESOLVERS));
+    let registrars: Vec<_> = (0..REGISTRARS)
+        .map(|registrar| {
+            let injector = injector.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                for index in 0..PER_REGISTRAR {
+                    let name: &'static str =
+                        Box::leak(format!("member {registrar}.{index}").into_boxed_str());
+                    injector.provide_into_set::<dyn Source>(ready_source(name));
+                }
+            })
+        })
+        .collect();
+    let resolvers: Vec<_> = (0..RESOLVERS)
+        .map(|_| {
+            let injector = injector.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                (0..SCOPES_PER_RESOLVER)
+                    .map(|_| {
+                        let scope = injector.create_scope();
+                        let set = scope.resolve_all_live::<dyn Source>();
+                        (scope, set)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    for registrar in registrars {
+        registrar.join().unwrap();
+    }
+    let sets: Vec<_> = resolvers
+        .into_iter()
+        .flat_map(|resolver| resolver.join().unwrap())
+        .collect();
+
+    for (_scope, set) in &sets {
+        let names: std::collections::HashSet<_> = runtime
+            .block_on(async { timeout(HANG, set.complete()).await })
+            .expect("a set member never became ready")
+            .unwrap()
+            .iter()
+            .map(|member| member.value.name())
+            .collect();
+        assert_eq!(set.members().len(), MEMBERS);
+        assert_eq!(names.len(), MEMBERS, "a slot is missing or duplicated");
+    }
+    let followed_len = runtime
+        .block_on(async { timeout(HANG, follower).await })
+        .expect("the follower never saw every member ready")
+        .unwrap();
+    assert_eq!(followed_len, MEMBERS);
+    let hard = runtime
+        .block_on(injector.try_resolve_all_async::<dyn Source>())
+        .unwrap();
+    assert_eq!(hard.len(), MEMBERS);
 }

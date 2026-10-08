@@ -150,3 +150,31 @@ fn concurrent_async_root_resolve_completes_and_caches() {
     let second = block_on(injector.try_resolve_async::<usize>()).unwrap();
     assert!(Shared::ptr_eq(&first, &second));
 }
+
+#[test]
+fn decorators_wrap_an_async_provider_in_order() {
+    let injector = Injector::root();
+    injector.provide::<String>(
+        Provider::transient_async(|_| async { Shared::new("base".to_string()) })
+            .with_decorator(|inner| Shared::new(format!("[{inner}]")))
+            .with_decorator(|inner| Shared::new(format!("({inner})"))),
+    );
+
+    let value = block_on(injector.try_resolve_async::<String>()).unwrap();
+    assert_eq!(value.as_str(), "([base])");
+}
+
+#[test]
+fn a_decorator_wraps_a_fallible_async_set_member() {
+    let injector = Injector::root();
+    injector.provide_into_set::<String>(
+        Provider::singleton_try_async(|_| async {
+            Ok::<_, std::io::Error>(Shared::new("member".to_string()))
+        })
+        .with_decorator(|inner| Shared::new(format!("<{inner}>"))),
+    );
+
+    let values = block_on(injector.try_resolve_all_async::<String>()).unwrap();
+    let values: Vec<&str> = values.iter().map(|value| value.as_str()).collect();
+    assert_eq!(values, vec!["<member>"]);
+}

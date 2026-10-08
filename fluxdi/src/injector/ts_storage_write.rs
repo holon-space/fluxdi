@@ -193,7 +193,12 @@ impl Injector {
         Ok(())
     }
 
-    pub(crate) fn store_set_provider<T>(&self, provider: Provider<T>) -> Result<(), Error>
+    /// Appends `provider` to this injector's set of `T` and returns it as
+    /// stored.
+    pub(crate) fn store_set_provider<T>(
+        &self,
+        provider: Provider<T>,
+    ) -> Result<Shared<Provider<T>>, Error>
     where
         T: ?Sized + Send + Sync + 'static,
     {
@@ -204,15 +209,16 @@ impl Injector {
         let scope = provider.scope;
         let graph_meta =
             ProviderGraphMeta::of::<T>(provider.scope, provider.dependency_hints.clone());
+        let provider = Shared::new(provider);
 
         #[cfg(feature = "lock-free")]
         {
             match self.inner.set_providers.entry(type_id) {
                 DashEntry::Occupied(mut entry) => {
-                    entry.get_mut().push(Shared::new(provider));
+                    entry.get_mut().push(provider.clone());
                 }
                 DashEntry::Vacant(entry) => {
-                    entry.insert(vec![Shared::new(provider)]);
+                    entry.insert(vec![provider.clone()]);
                 }
             }
             match self.inner.graph_set_providers.entry(type_id) {
@@ -228,10 +234,7 @@ impl Injector {
         #[cfg(not(feature = "lock-free"))]
         {
             let mut providers = self.inner.set_providers.write().unwrap();
-            providers
-                .entry(type_id)
-                .or_default()
-                .push(Shared::new(provider));
+            providers.entry(type_id).or_default().push(provider.clone());
             drop(providers);
             self.inner
                 .graph_set_providers
@@ -250,6 +253,6 @@ impl Injector {
             "Provider appended to set binding"
         );
 
-        Ok(())
+        Ok(provider)
     }
 }

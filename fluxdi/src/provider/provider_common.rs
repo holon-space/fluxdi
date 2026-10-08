@@ -92,7 +92,9 @@ impl<T: ?Sized + 'static> Provider<T> {
     /// Wraps resolved instances with a decorator (e.g. logging, caching).
     ///
     /// The decorator receives the base instance and returns a wrapped instance.
-    /// Order is deterministic: base factory runs first, then decorator.
+    /// Order is deterministic: base factory runs first, then decorator. It
+    /// wraps the value of every factory form: sync, async, and live, where it
+    /// also wraps each published partial.
     ///
     /// For multiple decorators, chain: `provider.with_decorator(d1).with_decorator(d2)`.
     #[cfg(not(feature = "thread-safe"))]
@@ -100,6 +102,7 @@ impl<T: ?Sized + 'static> Provider<T> {
     where
         F: Fn(Shared<T>) -> Shared<T> + 'static,
     {
+        let decorator = Shared::new(decorator);
         let Self {
             scope,
             factory,
@@ -111,24 +114,36 @@ impl<T: ?Sized + 'static> Provider<T> {
         } = self;
         Self {
             scope,
-            factory: Box::new(move |inj| {
-                let instance = factory(inj);
-                Instance::new(decorator(instance.value()))
-            }),
+            factory: {
+                let decorator = decorator.clone();
+                Box::new(move |inj| Instance::new((*decorator)(factory(inj).value())))
+            },
             #[cfg(feature = "async-factory")]
-            async_factory,
+            async_factory: async_factory.map(|async_factory| {
+                Box::new(move |inj| {
+                    let run = async_factory(inj);
+                    let decorator = decorator.clone();
+                    Box::pin(async move {
+                        run.await
+                            .map(|instance| Instance::new((*decorator)(instance.value())))
+                    })
+                        as Pin<Box<dyn Future<Output = Result<Instance<T>, Error>>>>
+                }) as AsyncFactory<T>
+            }),
             limits,
             dependency_hints,
             limiter,
         }
     }
 
-    /// Wraps resolved instances with a decorator (thread-safe).
+    /// Wraps resolved instances with a decorator (thread-safe); see the
+    /// single-threaded variant.
     #[cfg(feature = "thread-safe")]
     pub fn with_decorator<F>(self, decorator: F) -> Self
     where
         F: Fn(Shared<T>) -> Shared<T> + Send + Sync + 'static,
     {
+        let decorator = Shared::new(decorator);
         let Self {
             scope,
             factory,
@@ -142,14 +157,33 @@ impl<T: ?Sized + 'static> Provider<T> {
         } = self;
         Self {
             scope,
-            factory: Box::new(move |inj| {
-                let instance = factory(inj);
-                Instance::new(decorator(instance.value()))
-            }),
+            factory: {
+                let decorator = decorator.clone();
+                Box::new(move |inj| Instance::new((*decorator)(factory(inj).value())))
+            },
             #[cfg(feature = "async-factory")]
-            async_factory,
+            async_factory: async_factory.map(|async_factory| {
+                let decorator = decorator.clone();
+                Box::new(move |inj| {
+                    let run = async_factory(inj);
+                    let decorator = decorator.clone();
+                    Box::pin(async move {
+                        run.await
+                            .map(|instance| Instance::new((*decorator)(instance.value())))
+                    }) as AsyncRun<T>
+                }) as AsyncFactory<T>
+            }),
             #[cfg(feature = "live")]
-            live_factory,
+            live_factory: live_factory.map(|live_factory| {
+                Box::new(move |inj, publisher: crate::live::LivePublisher<T>| {
+                    let run = live_factory(inj, publisher.decorated(decorator.clone()));
+                    let decorator = decorator.clone();
+                    Box::pin(async move {
+                        run.await
+                            .map(|instance| Instance::new((*decorator)(instance.value())))
+                    }) as AsyncRun<T>
+                }) as LiveFactory<T>
+            }),
             limits,
             dependency_hints,
             limiter,
