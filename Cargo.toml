@@ -1,5 +1,5 @@
 [workspace]
-members = ["fluxdi", "fluxdi-macros", "examples/*"]
+members = ["fluxdi", "fluxdi-macros", "live-envelope", "examples/*"]
 default-members = ["fluxdi"]
 resolver = "2"
 

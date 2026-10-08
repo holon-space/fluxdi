@@ -59,16 +59,26 @@ impl CellKey {
     }
 }
 
-/// One factory run; a retry after a failure is a new run.
+/// One factory run, or one live producer; a retry after a failure is a new run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RunRef {
+pub(crate) struct RunRef {
     id: u64,
     type_name: &'static str,
 }
 
+impl RunRef {
+    pub(super) fn next(type_name: &'static str) -> Self {
+        static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+        Self {
+            id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
+            type_name,
+        }
+    }
+}
+
 thread_local! {
     /// The run whose factory is being polled on this thread.
-    static CURRENT_RUN: LocalCell<Option<RunRef>> = const { LocalCell::new(None) };
+    pub(super) static CURRENT_RUN: LocalCell<Option<RunRef>> = const { LocalCell::new(None) };
 }
 
 #[cfg(feature = "thread-safe")]
@@ -163,6 +173,8 @@ pub(crate) struct CellRegistry {
     runs: Mutex<HashMap<CellKey, RunEntry>>,
     /// `(waiter, awaited)`: the factory of `waiter` awaits the run `awaited`.
     waits: Mutex<Vec<(RunRef, RunRef)>>,
+    #[cfg(feature = "live")]
+    pub(super) live: super::live_cells::LiveCells,
 }
 
 enum Cell<T: ?Sized + CellValue> {
@@ -183,8 +195,6 @@ impl CellRegistry {
         key: CellKey,
         cached: impl FnOnce() -> Option<Shared<Instance<T>>>,
     ) -> Cell<T> {
-        static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
-
         let mut runs = self.runs.lock().expect("cell registry mutex poisoned");
         if let Some(entry) = runs.get(&key) {
             let cell = entry
@@ -197,10 +207,7 @@ impl CellRegistry {
             return Cell::Cached(instance);
         }
 
-        let run = RunRef {
-            id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
-            type_name: std::any::type_name::<T>(),
-        };
+        let run = RunRef::next(std::any::type_name::<T>());
         let cell = Shared::new(RunCell {
             state: Mutex::new(RunState {
                 outcome: None,
@@ -225,7 +232,7 @@ impl CellRegistry {
 
     /// Records that the run being polled on this thread, if any, awaits
     /// `awaited`, unless `awaited` already waits for it.
-    fn begin_wait(&self, awaited: RunRef) -> Result<WaitEdge<'_>, Error> {
+    pub(crate) fn begin_wait(&self, awaited: RunRef) -> Result<WaitEdge<'_>, Error> {
         let Some(waiter) = future_local::current(&CURRENT_RUN) else {
             return Ok(WaitEdge {
                 registry: self,
@@ -294,7 +301,7 @@ impl<T: ?Sized + CellValue> Drop for Driver<T> {
     }
 }
 
-struct WaitEdge<'a> {
+pub(crate) struct WaitEdge<'a> {
     registry: &'a CellRegistry,
     edge: Option<(RunRef, RunRef)>,
 }
@@ -335,15 +342,45 @@ fn wait_path(waits: &[(RunRef, RunRef)], from: RunRef, to: RunRef, path: &mut Ve
 
 impl Injector {
     /// Resolves a cached binding through its cell in `key`; `produce` runs
-    /// the factory and stores the instance in the cache.
+    /// the factory and stores the instance in the cache. A live cell of
+    /// `key` takes precedence: the resolve waits for its producer.
     pub(super) async fn resolve_in_cell<T: ?Sized + CellValue>(
         &self,
         key: CellKey,
         cached: impl Fn() -> Option<Shared<Instance<T>>>,
         produce: impl Fn() -> RunFuture<T>,
     ) -> RunResult<T> {
+        self.drive_or_join(key, cached, produce, true).await
+    }
+
+    /// [`Self::resolve_in_cell`] for the producer of the live cell of `key`.
+    #[cfg(feature = "live")]
+    pub(super) async fn produce_in_cell<T: ?Sized + CellValue>(
+        &self,
+        key: CellKey,
+        cached: impl Fn() -> Option<Shared<Instance<T>>>,
+        produce: impl Fn() -> RunFuture<T>,
+    ) -> RunResult<T> {
+        self.drive_or_join(key, cached, produce, false).await
+    }
+
+    #[cfg_attr(not(feature = "live"), allow(unused_variables))]
+    async fn drive_or_join<T: ?Sized + CellValue>(
+        &self,
+        key: CellKey,
+        cached: impl Fn() -> Option<Shared<Instance<T>>>,
+        produce: impl Fn() -> RunFuture<T>,
+        follow_live: bool,
+    ) -> RunResult<T> {
         let registry = &self.inner.cells;
         loop {
+            #[cfg(feature = "live")]
+            if follow_live && let Some(live) = registry.live_observed::<T>(&key) {
+                return live
+                    .ready()
+                    .await
+                    .map(|value| Shared::new(Instance::new(value)));
+            }
             match registry.cell(key.clone(), &cached) {
                 Cell::Cached(instance) => return Ok(instance),
                 Cell::Drive(driver) => {

@@ -60,6 +60,15 @@ pub enum ErrorKind {
     EagerResolutionFailed,
     /// A fallible async factory returned an error; it is the [`Error`]'s `source()`.
     FactoryFailed,
+    /// A live dependency's producer failed or panicked.
+    LiveProducerFailed,
+    /// A live dependency's producer was cancelled before it finished.
+    LiveProducerCancelled,
+    /// A live resolve found no tokio runtime: none was given to the
+    /// injector, and the calling thread has none.
+    LiveRuntimeMissing,
+    /// A transient provider was resolved live; a live cell needs a cached value.
+    LiveRequiresCachedScope,
 }
 
 /// Container error structure.
@@ -259,6 +268,58 @@ impl Error {
         );
         error.source = Some(Arc::from(source));
         error
+    }
+
+    /// A live dependency's producer failed with `source`.
+    pub fn live_producer_failed(type_name: &str, source: &Error) -> Self {
+        let mut error = Self::new(
+            ErrorKind::LiveProducerFailed,
+            format!("Live producer for {} failed: {}", type_name, source.message),
+        );
+        error.source = Some(Arc::new(source.clone()));
+        error
+    }
+
+    /// The factory of `type_name` panicked with `panic`.
+    pub fn factory_panicked(type_name: &str, panic: &str) -> Self {
+        Self::new(
+            ErrorKind::FactoryFailed,
+            format!("Factory for type {} panicked: {}", type_name, panic),
+        )
+    }
+
+    /// A live dependency's producer was cancelled before it finished.
+    pub fn live_producer_cancelled(type_name: &str) -> Self {
+        Self::new(
+            ErrorKind::LiveProducerCancelled,
+            format!(
+                "Live producer for {} was cancelled before it finished",
+                type_name
+            ),
+        )
+    }
+
+    /// No tokio runtime to run a live producer of `type_name` on.
+    pub fn live_runtime_missing(type_name: &str) -> Self {
+        Self::new(
+            ErrorKind::LiveRuntimeMissing,
+            format!(
+                "Cannot resolve {} live: the injector holds no tokio runtime handle \
+                 (Injector::root_with_runtime) and the calling thread has no runtime",
+                type_name
+            ),
+        )
+    }
+
+    /// A transient provider was resolved live.
+    pub fn live_requires_cached_scope(type_name: &str) -> Self {
+        Self::new(
+            ErrorKind::LiveRequiresCachedScope,
+            format!(
+                "{} is transient; a live resolve needs a cached scope (singleton, root, module or scoped)",
+                type_name
+            ),
+        )
     }
 
     /// Dependency graph validation failed.

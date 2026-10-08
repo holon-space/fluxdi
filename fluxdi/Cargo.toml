@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3.19", optional = true, features = ["env-fil
 dashmap = { version = "6.1.0", optional = true }
 tokio = { version = "1.43.0", default-features = false, features = ["sync", "time", "rt"], optional = true }
 fluxdi-macros = { path = "../fluxdi-macros", optional = true, version = "1.2.2" }
+live-envelope = { path = "../live-envelope", optional = true, version = "0.1.0" }
 futures = "0.3.31"
 
 [features]
@@ -47,6 +48,7 @@ macros = ["dep:fluxdi-macros"]
 lifecycle = ["dep:tokio"]
 dynamic = ["thread-safe", "async-factory"]
 eager-resolution = ["thread-safe", "async-factory"]
+live = ["thread-safe", "async-factory", "dep:tokio", "dep:live-envelope"]
 
 [dev-dependencies]
 anyhow = "1.0.99"

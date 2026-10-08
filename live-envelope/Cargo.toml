@@ -1,0 +1,12 @@
+[package]
+name = "live-envelope"
+version = "0.1.0"
+description = "What a UI observes of a value produced elsewhere: state, completeness, error"
+
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+authors.workspace = true
+
+[dependencies]

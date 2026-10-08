@@ -92,6 +92,20 @@ pub(crate) async fn resolving<R>(
     crate::future_local::WithLocal::new(&RESOLUTION_PATH, path, resolve).await
 }
 
+/// Runs the async resolve of `type_id` on a new path that starts with it,
+/// whatever path the thread polling it is on.
+#[cfg(feature = "live")]
+pub(crate) async fn resolving_on_new_path<R>(
+    type_id: TypeId,
+    resolve: impl std::future::Future<Output = Result<R, Error>>,
+) -> Result<R, Error> {
+    let path = Arc::new(PathNode {
+        type_id,
+        parent: None,
+    });
+    crate::future_local::WithLocal::new(&RESOLUTION_PATH, path, resolve).await
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Error, ErrorKind, Injector, Provider, Shared};

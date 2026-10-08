@@ -11,6 +11,8 @@ mod future_local;
 pub mod graph;
 pub mod injector;
 pub mod instance;
+#[cfg(feature = "live")]
+pub mod live;
 pub mod module;
 pub mod observability;
 pub mod provider;
@@ -29,6 +31,8 @@ pub use fluxdi_macros::Injectable;
 pub use graph::*;
 pub use injector::*;
 pub use instance::*;
+#[cfg(feature = "live")]
+pub use live::{Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState, LiveTiming};
 pub use module::*;
 pub use observability::*;
 pub use provider::*;

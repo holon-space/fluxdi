@@ -286,7 +286,7 @@ impl Clone for Injector {
 #[cfg(all(test, feature = "async-factory"))]
 mod async_factory_tests;
 #[cfg(feature = "async-factory")]
-mod cells;
+pub(crate) mod cells;
 mod core_lifecycle;
 #[cfg(all(test, feature = "dynamic"))]
 mod dynamic_tests;
@@ -298,6 +298,8 @@ mod graph_state;
 mod graph_validation;
 #[cfg(all(test, feature = "async-factory"))]
 mod in_flight_cell_tests;
+#[cfg(feature = "live")]
+mod live_cells;
 
 #[cfg(not(feature = "thread-safe"))]
 mod nts_instance_factory;
