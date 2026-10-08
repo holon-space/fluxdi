@@ -43,7 +43,9 @@ impl Injector {
             return Err(Error::async_factory_requires_async_resolve(type_name));
         }
 
-        let instance = Shared::new((provider_ref.factory)(self));
+        let instance = Shared::new(factory_boundary::run_sync(type_name, || {
+            (provider_ref.factory)(self)
+        })?);
         drop(permit);
         #[cfg(feature = "tracing")]
         trace!(
@@ -104,7 +106,9 @@ impl Injector {
             return Err(Error::async_factory_requires_async_resolve(type_name));
         }
 
-        let instance = Shared::new((provider_ref.factory)(self));
+        let instance = Shared::new(factory_boundary::run_sync(type_name, || {
+            (provider_ref.factory)(self)
+        })?);
         drop(permit);
         #[cfg(feature = "tracing")]
         trace!(
@@ -161,7 +165,9 @@ impl Injector {
             return Err(Error::async_factory_requires_async_resolve(type_name));
         }
 
-        let instance = Shared::new((provider_ref.factory)(self));
+        let instance = Shared::new(factory_boundary::run_sync(type_name, || {
+            (provider_ref.factory)(self)
+        })?);
         drop(permit);
         #[cfg(feature = "tracing")]
         trace!(
@@ -222,8 +228,10 @@ impl Injector {
                 "Async factory permit acquired"
             );
 
-            if let Some(run) = run(&provider_ref, self.clone()) {
-                let instance = Shared::new(run.await?);
+            if let Some(run) =
+                factory_boundary::run_sync(type_name, || run(&provider_ref, self.clone()))?
+            {
+                let instance = Shared::new(factory_boundary::run_async(type_name, run).await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
@@ -236,7 +244,9 @@ impl Injector {
                 return Ok(instance);
             }
 
-            let instance = Shared::new((provider_ref.factory)(self));
+            let instance = Shared::new(factory_boundary::run_sync(type_name, || {
+                (provider_ref.factory)(self)
+            })?);
             drop(permit);
             #[cfg(feature = "tracing")]
             trace!(
@@ -302,7 +312,8 @@ impl Injector {
             );
 
             if let Some(async_factory) = &provider_ref.async_factory {
-                let instance = Shared::new((async_factory)(self.clone()).await?);
+                let run = factory_boundary::run_sync(type_name, || (async_factory)(self.clone()))?;
+                let instance = Shared::new(factory_boundary::run_async(type_name, run).await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
@@ -316,7 +327,9 @@ impl Injector {
                 return Ok(instance);
             }
 
-            let instance = Shared::new((provider_ref.factory)(self));
+            let instance = Shared::new(factory_boundary::run_sync(type_name, || {
+                (provider_ref.factory)(self)
+            })?);
             drop(permit);
             #[cfg(feature = "tracing")]
             trace!(
@@ -397,8 +410,10 @@ impl Injector {
                 "Async factory permit acquired for set binding"
             );
 
-            if let Some(run) = run(provider_ref, self.clone()) {
-                let instance = Shared::new(run.await?);
+            if let Some(run) =
+                factory_boundary::run_sync(type_name, || run(provider_ref, self.clone()))?
+            {
+                let instance = Shared::new(factory_boundary::run_async(type_name, run).await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
@@ -411,7 +426,9 @@ impl Injector {
                 return Ok(instance);
             }
 
-            let instance = Shared::new((provider_ref.factory)(self));
+            let instance = Shared::new(factory_boundary::run_sync(type_name, || {
+                (provider_ref.factory)(self)
+            })?);
             drop(permit);
             #[cfg(feature = "tracing")]
             trace!(

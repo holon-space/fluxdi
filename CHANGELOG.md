@@ -17,11 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `Error::module_lifecycle_failed_with_source()`: a lifecycle error whose `source()` is the hook's error
 - `try_optional_resolve`, `try_optional_resolve_named`, `try_optional_resolve_all` and their `_async` forms: `Ok(None)` only when no provider is registered; every other failure is returned
+- `Error::module_name()`: the module whose lifecycle hook failed; for an aggregate, the module of its first failure
 
 ### Changed
 
 - Bootstrap and shutdown keep a module's `configure`/`on_start`/`on_stop` error as the lifecycle error's `source()`; the message is unchanged. `bootstrap_aggregate`/`shutdown_aggregate` keep the first failure as `source()`
 - A failed `on_stop` during bootstrap rollback is reported in the bootstrap error after the start failure, instead of being discarded
+- Lifecycle errors name the failing module's concrete type (`Module::type_name`) instead of `dyn Module`
+- A panic in a factory (sync or async, hard or live) is a failure of that resolve: `ErrorKind::FactoryFailed` with a `FactoryPanic` source, and nothing is cached. With `panic = "abort"` the process still aborts
+- fluxdi compiles with default features
 - `optional_resolve*` is deprecated: it turns every failure, including a failed factory, into `None`; use `try_optional_resolve*`
 - **Performance**: Cache-hit resolve skips `ResolveGuard` (no recursion); ~67% faster cached resolve (~20 ns → ~12 ns default)
 

@@ -115,7 +115,8 @@ impl Injector {
             .ok_or_else(|| Error::dynamic_provider_not_found(name))?;
 
         // Call factory
-        let instance = (provider.factory)(self.clone()).await?;
+        let run = factory_boundary::run_sync(name, || (provider.factory)(self.clone()))?;
+        let instance = factory_boundary::run_async(name, run).await?;
 
         // Cache if non-transient
         if provider.scope != Scope::Transient

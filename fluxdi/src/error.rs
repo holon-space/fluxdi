@@ -121,6 +121,7 @@ pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
     source: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
+    module: Option<String>,
 }
 
 impl Error {
@@ -132,12 +133,19 @@ impl Error {
             kind: kind.clone(),
             message: message.into(),
             source: None,
+            module: None,
         };
 
         #[cfg(feature = "tracing")]
         error!("{}", error);
 
         error
+    }
+
+    /// The module whose lifecycle hook failed, for a `ModuleLifecycleFailed`
+    /// error; for an aggregate, the module of its first failure.
+    pub fn module_name(&self) -> Option<&str> {
+        self.module.as_deref()
     }
 
     /// Service provider not found for the requested type.
@@ -242,13 +250,15 @@ impl Error {
 
     /// Module lifecycle hook failed.
     pub fn module_lifecycle_failed(module_name: &str, phase: &str, details: &str) -> Self {
-        Self::new(
+        let mut error = Self::new(
             ErrorKind::ModuleLifecycleFailed,
             format!(
                 "Module lifecycle failed: module={}, phase={}, details={}",
                 module_name, phase, details
             ),
-        )
+        );
+        error.module = Some(module_name.to_string());
+        error
     }
 
     /// A module's lifecycle `phase` failed with `source`, which is the
@@ -486,6 +496,7 @@ impl Error {
                 .join("\n")
         );
         let mut error = Self::new(ErrorKind::ModuleLifecycleFailed, message);
+        error.module = first.module.clone();
         error.source = Some(Arc::new(first));
         error
     }
@@ -511,6 +522,7 @@ impl Error {
                 .join("\n")
         );
         let mut error = Self::new(ErrorKind::ModuleLifecycleFailed, message);
+        error.module = first.module.clone();
         error.source = Some(Arc::new(first));
         error
     }

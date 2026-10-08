@@ -38,7 +38,7 @@ impl Application {
         #[cfg(feature = "tracing")]
         debug!("Registering module providers");
 
-        let module_name = std::any::type_name_of_val(&*module);
+        let module_name = module.type_name();
         module.configure(&module_injector).map_err(|err| {
             Error::module_lifecycle_failed_with_source(module_name, "configure", err)
         })?;
@@ -103,7 +103,7 @@ impl Application {
                     module_injector,
                     module,
                 } => {
-                    let module_name = std::any::type_name_of_val(&*module);
+                    let module_name = module.type_name();
                     if let Err(err) = module.configure(&module_injector) {
                         let mut errors = vec![Error::module_lifecycle_failed_with_source(
                             module_name,
@@ -177,7 +177,7 @@ impl Application {
                     module_injector,
                     module,
                 } => {
-                    let module_name = std::any::type_name_of_val(&*module);
+                    let module_name = module.type_name();
                     if let Err(err) = module.configure(&module_injector) {
                         let mut errors = vec![Error::module_lifecycle_failed_with_source(
                             module_name,
@@ -196,7 +196,7 @@ impl Application {
         let futures: Vec<_> = pending
             .into_iter()
             .map(|(module, injector)| {
-                let module_name = std::any::type_name_of_val(&*module);
+                let module_name = module.type_name();
                 async move {
                     let result = module.on_start(injector.clone()).await;
                     (module, injector, module_name, result)
@@ -237,7 +237,7 @@ impl Application {
     async fn roll_back(root: &Injector, mut started: Vec<LoadedModule>, errors: &mut Vec<Error>) {
         Self::end_live_production(root);
         while let Some(loaded) = started.pop() {
-            let module_name = std::any::type_name_of_val(&*loaded.module);
+            let module_name = loaded.module.type_name();
             if let Err(err) = loaded.module.on_stop(loaded.injector.clone()).await {
                 errors.push(Error::module_lifecycle_failed_with_source(
                     module_name,

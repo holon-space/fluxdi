@@ -108,7 +108,9 @@ pub(crate) async fn resolving_on_new_path<R>(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Error, ErrorKind, Injector, Provider, Shared};
+    #[cfg(feature = "async-factory")]
+    use crate::Error;
+    use crate::{ErrorKind, Injector, Provider, Shared};
     use std::sync::{Arc, Mutex};
 
     struct A;

@@ -262,6 +262,7 @@ impl ProviderGraphMeta {
     }
 }
 
+#[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct DynamicProviderGraphMeta {
     pub(crate) name: String,

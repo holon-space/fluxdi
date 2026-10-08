@@ -220,7 +220,7 @@ impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
                     .catch_unwind()
                     .map(|outcome| {
                         outcome.unwrap_or_else(|panic| {
-                            Err(Error::factory_panicked(type_name, &panic_message(&*panic)))
+                            Err(super::factory_boundary::panicked(type_name, &*panic))
                         })
                     }),
                 ) as RunFuture<T>
@@ -380,16 +380,6 @@ impl<T: ?Sized> Drop for Reporter<T> {
         };
         self.finish(LiveState::Failed(error));
     }
-}
-
-fn panic_message(panic: &(dyn Any + Send)) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = panic.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "a non-string payload".to_string()
 }
 
 impl Injector {

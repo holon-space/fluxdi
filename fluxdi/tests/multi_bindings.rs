@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fluxdi::{ErrorKind, Injector, Provider, Shared};
+#[cfg(feature = "async-factory")]
+use fluxdi::ErrorKind;
+use fluxdi::{Injector, Provider, Shared};
 
 trait PipelineStep: Send + Sync {
     fn id(&self) -> &'static str;

@@ -136,7 +136,7 @@ impl Application {
         let mut shutdown_errors = Vec::new();
 
         while let Some(loaded) = self.started_modules.pop() {
-            let module_name = std::any::type_name_of_val(&*loaded.module);
+            let module_name = loaded.module.type_name();
             if let Err(err) = loaded.module.on_stop(loaded.injector.clone()).await {
                 shutdown_errors.push(Error::module_lifecycle_failed_with_source(
                     module_name,
@@ -197,7 +197,7 @@ impl Application {
 
         while let Some(loaded) = self.started_modules.pop() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let module_name = std::any::type_name_of_val(&*loaded.module);
+            let module_name = loaded.module.type_name();
 
             match tokio::time::timeout(
                 std::cmp::max(remaining, std::time::Duration::from_millis(1)),

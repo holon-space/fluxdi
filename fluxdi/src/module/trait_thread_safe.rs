@@ -38,6 +38,7 @@ pub trait Module: Send + Sync {
     ///
     /// This method provides a human-readable representation of the module's type,
     /// which is particularly useful for debugging, logging, and error messages.
+    /// Lifecycle errors name the failing module with it ([`Error::module_name`]).
     ///
     /// # Returns
     ///

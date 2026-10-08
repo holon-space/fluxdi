@@ -303,3 +303,83 @@ fn a_parallel_configure_failure_stops_no_module_because_none_started() {
     assert_keeps_typed_source(&err, "configure");
     assert!(!err.message.contains("phase=on_stop"), "{}", err.message);
 }
+
+fn assert_names_module(err: &Error, module: &str) {
+    assert_eq!(err.module_name(), Some(module), "{}", err.message);
+    assert!(
+        err.message.contains(&format!("module={module},")),
+        "module {module} not named: {}",
+        err.message
+    );
+}
+
+#[test]
+fn every_lifecycle_failure_names_the_concrete_module() {
+    let failing = std::any::type_name::<TypedFailureModule>();
+    let err = Application::new(TypedFailureModule::fails_in(Phase::Configure))
+        .bootstrap_sync()
+        .unwrap_err();
+    assert_names_module(&err, failing);
+
+    for (phase, parallel) in [
+        (Phase::Configure, false),
+        (Phase::Configure, true),
+        (Phase::OnStart, false),
+        (Phase::OnStart, true),
+    ] {
+        let mut app = Application::new(TypedFailureModule::fails_in(phase));
+        let opts = BootstrapOptions::default().with_parallel_start(parallel);
+        let err = block_on(app.bootstrap_with_options(opts)).unwrap_err();
+        assert_names_module(&err, failing);
+    }
+
+    let mut app = Application::new(TypedFailureModule::fails_in(Phase::OnStop));
+    block_on(app.bootstrap()).unwrap();
+    assert_names_module(&block_on(app.shutdown()).unwrap_err(), failing);
+}
+
+#[test]
+fn an_aggregate_names_the_module_whose_failure_ended_the_bootstrap() {
+    let stopped = std::any::type_name::<TypedFailureModule>();
+    for parallel in [false, true] {
+        let mut app = Application::new(FailsAfterImportStarted);
+        let opts = BootstrapOptions::default().with_parallel_start(parallel);
+        let err = block_on(app.bootstrap_with_options(opts)).unwrap_err();
+        assert_eq!(
+            err.module_name(),
+            Some(std::any::type_name::<FailsAfterImportStarted>()),
+            "parallel={parallel}: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains(&format!("module={stopped}, phase=on_stop")),
+            "the rollback failure does not name {stopped}: {}",
+            err.message
+        );
+    }
+
+    let mut app = Application::new(FailsConfigureAfterImportStarted);
+    let err = block_on(app.bootstrap()).unwrap_err();
+    assert_names_module(
+        std::error::Error::source(&err)
+            .and_then(|e| e.downcast_ref::<Error>())
+            .expect("the aggregate's source is a fluxdi Error"),
+        std::any::type_name::<FailsConfigureAfterImportStarted>(),
+    );
+    assert_eq!(
+        err.module_name(),
+        Some(std::any::type_name::<FailsConfigureAfterImportStarted>())
+    );
+}
+
+#[cfg(feature = "lifecycle")]
+#[tokio::test]
+async fn an_on_stop_failure_under_a_shutdown_deadline_names_the_module() {
+    let mut app = Application::new(TypedFailureModule::fails_in(Phase::OnStop));
+    app.bootstrap().await.unwrap();
+    let opts = crate::application::options::ShutdownOptions::default()
+        .with_timeout(std::time::Duration::from_secs(5));
+    let err = app.shutdown_with_options(opts).await.unwrap_err();
+    assert_names_module(&err, std::any::type_name::<TypedFailureModule>());
+}
