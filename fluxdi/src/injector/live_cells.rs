@@ -227,11 +227,11 @@ impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
             };
             resolver.produce_in_cell(key, cached, produce).await
         };
-        WithLocal::new(
+        crate::live::off_non_blocking_path(WithLocal::new(
             &CURRENT_RUN,
             producer,
             crate::resolve_guard::resolving_on_new_path(TypeId::of::<T>(), run),
-        )
+        ))
     }
 }
 

@@ -237,6 +237,8 @@ impl CellRegistry {
         let Some(waiter) = future_local::current(&CURRENT_RUN) else {
             return Ok(WaitEdge {
                 registry: self,
+                #[cfg(feature = "live")]
+                awaited,
                 wait: None,
             });
         };
@@ -266,6 +268,8 @@ impl CellRegistry {
         waits.push(wait.clone());
         Ok(WaitEdge {
             registry: self,
+            #[cfg(feature = "live")]
+            awaited,
             wait: Some(wait),
         })
     }
@@ -374,13 +378,16 @@ impl Refusal {
 /// A recorded wait; the only way to await the end of another run.
 pub(crate) struct WaitEdge<'a> {
     registry: &'a CellRegistry,
+    #[cfg(feature = "live")]
+    awaited: RunRef,
     /// `None` when no run is being polled, so nothing is recorded.
     wait: Option<Wait>,
 }
 
 impl<'a> WaitEdge<'a> {
     /// Awaits `run_end`, or fails with `CircularDependency` once a refused
-    /// wait closes a cycle through this one.
+    /// wait closes a cycle through this one, or with `LiveWaitOnRenderPath`
+    /// when polled on a non-blocking path.
     pub(crate) fn wait<F: Future + Unpin>(&self, run_end: F) -> EdgeWait<'_, 'a, F> {
         EdgeWait {
             edge: self,
@@ -398,6 +405,10 @@ impl<F: Future + Unpin> Future for EdgeWait<'_, '_, F> {
     type Output = Result<F::Output, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        #[cfg(feature = "live")]
+        if let Err(error) = crate::live::refuse_wait(self.edge.awaited.type_name) {
+            return Poll::Ready(Err(error));
+        }
         if let Some(wait) = &self.edge.wait
             && let Poll::Ready(error) = wait.refusal.poll(cx)
         {

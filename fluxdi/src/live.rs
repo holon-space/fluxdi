@@ -17,6 +17,10 @@
 //! The factory of a live provider gets a [`LivePublisher`] and may publish
 //! `Partial` values before it returns. Only a live handle's state shows
 //! them; `ready()` and hard resolves wait for the final value.
+//!
+//! Code that must never wait, such as a UI render, runs inside
+//! [`non_blocking_scope`] or [`non_blocking_section`]. There it may read
+//! `state()` and follow `changed()`; a wait fails with `LiveWaitOnRenderPath`.
 
 use std::time::Duration;
 
@@ -25,6 +29,9 @@ use tokio::sync::watch;
 mod channel;
 pub(crate) use channel::CellReceiver;
 use channel::RunEnd;
+mod render_path;
+pub use render_path::{non_blocking_scope, non_blocking_section};
+pub(crate) use render_path::{off_non_blocking_path, refuse_wait};
 
 use crate::error::Error;
 use crate::injector::cells::{CellRegistry, RunRef};
@@ -270,8 +277,11 @@ impl<T: ?Sized + Send + Sync + 'static> Live<T> {
     /// The hard edge on a live dependency: waits for a terminal state of the
     /// newest generation it sees. Fails at once with `CircularDependency`
     /// when the producer, directly or through other runs, already waits for
-    /// the caller's run.
+    /// the caller's run. Fails with `LiveWaitOnRenderPath` on a non-blocking
+    /// path ([`non_blocking_scope`], [`non_blocking_section`]), even when
+    /// the state is already terminal.
     pub async fn ready(&self) -> Result<Generational<Shared<T>>, Error> {
+        refuse_wait(std::any::type_name::<T>())?;
         self.watch.ready().await
     }
 
@@ -394,7 +404,7 @@ impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
     ///
     /// Waits on every unfinished member at once, so it fails at once with
     /// `CircularDependency` when a cycle closes through one of these waits,
-    /// on either side.
+    /// on either side. Refused on a non-blocking path like [`Live::ready`].
     pub fn complete(
         &self,
     ) -> impl Future<Output = Result<Vec<Generational<Shared<T>>>, Error>> + Send + 'static {
@@ -404,6 +414,7 @@ impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
             .map(|member| member.watch.settle())
             .collect();
         async move {
+            refuse_wait(std::any::type_name::<T>())?;
             let outcomes = futures::future::try_join_all(settles).await?;
             outcomes.into_iter().collect()
         }
@@ -492,5 +503,7 @@ impl LiveReportChanges {
     }
 }
 
+#[cfg(test)]
+mod render_path_tests;
 #[cfg(test)]
 mod tests;

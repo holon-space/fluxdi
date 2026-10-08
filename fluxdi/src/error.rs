@@ -61,6 +61,7 @@ use tracing::error;
 ///         ErrorKind::LiveRestartWhileRunning => true,
 ///         ErrorKind::LiveInjectorDropped => false,
 ///         ErrorKind::LiveSlotOutOfRange => false,
+///         ErrorKind::LiveWaitOnRenderPath => false,
 ///     }
 /// }
 /// ```
@@ -105,6 +106,10 @@ pub enum ErrorKind {
     LiveInjectorDropped,
     /// A live set was asked for a slot it does not have.
     LiveSlotOutOfRange,
+    /// Code marked as non-blocking (`live::non_blocking_scope`,
+    /// `live::non_blocking_section`) waited for a live producer or for
+    /// another resolve's run.
+    LiveWaitOnRenderPath,
 }
 
 /// Container error structure.
@@ -375,6 +380,18 @@ impl Error {
             format!(
                 "Live set of {} has no slot {}: it has {} members",
                 type_name, slot, len
+            ),
+        )
+    }
+
+    /// A wait for `type_name` on a non-blocking path.
+    pub fn live_wait_on_render_path(type_name: &str) -> Self {
+        Self::new(
+            ErrorKind::LiveWaitOnRenderPath,
+            format!(
+                "Waited for {} on a non-blocking path (non_blocking_scope or \
+                 non_blocking_section); read state() or follow changed() there instead",
+                type_name
             ),
         )
     }

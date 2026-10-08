@@ -847,7 +847,9 @@ async fn a_set_member_publishes_partials_in_its_slot() {
     let partial = timeout(HANG, async {
         loop {
             let members = set.changed().await;
-            if let LiveState::Partial(source) = &members[1].value {
+            if let (LiveState::Ready(_), LiveState::Partial(source)) =
+                (&members[0].value, &members[1].value)
+            {
                 return source.name();
             }
         }
