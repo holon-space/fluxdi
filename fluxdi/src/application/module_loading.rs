@@ -77,6 +77,7 @@ impl Application {
             },
         }
 
+        let root = parent.clone();
         let mut stack = vec![Frame::Enter { parent, module }];
         let mut loaded: Vec<LoadedModule> = Vec::new();
 
@@ -108,6 +109,7 @@ impl Application {
                     })?;
 
                     if let Err(err) = module.on_start(module_injector.clone()).await {
+                        Self::end_live_production(&root);
                         // Rollback: call on_stop on already-started modules (reverse order)
                         while let Some(loaded_mod) = loaded.pop() {
                             let _ = loaded_mod.module.on_stop(loaded_mod.injector.clone()).await;
@@ -146,6 +148,7 @@ impl Application {
             },
         }
 
+        let root = parent.clone();
         let mut stack = vec![Frame::Enter { parent, module }];
         let mut pending: Vec<(ModuleObject, Shared<Injector>)> = Vec::new();
 
@@ -215,6 +218,7 @@ impl Application {
         if bootstrap_errors.is_empty() {
             Ok(loaded)
         } else {
+            Self::end_live_production(&root);
             // Rollback: call on_stop on successfully-started modules (reverse order)
             while let Some(loaded_mod) = loaded.pop() {
                 let _ = loaded_mod.module.on_stop(loaded_mod.injector.clone()).await;

@@ -580,7 +580,9 @@ impl Injector {
     /// Ends live production in this injector tree for good: every running
     /// producer is cancelled, and its observers see `LiveProducerCancelled`.
     /// Afterwards no producer starts: a restart, or a live resolve that would
-    /// need one, fails with `LiveProducerCancelled`.
+    /// need one, fails with `LiveProducerCancelled`. A second call does
+    /// nothing. [`Application::shutdown`](crate::application::Application::shutdown)
+    /// calls it before any module's `on_stop`.
     pub fn shutdown_live(&self) {
         let mut producers = self
             .inner

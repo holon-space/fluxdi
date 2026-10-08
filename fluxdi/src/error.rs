@@ -108,7 +108,8 @@ pub enum ErrorKind {
     LiveSlotOutOfRange,
     /// Code marked as non-blocking (`live::non_blocking_scope`,
     /// `live::non_blocking_section`) waited for a live producer or for
-    /// another resolve's run.
+    /// another resolve's run. A factory that fails with this refusal keeps
+    /// this kind, not `FactoryFailed`.
     LiveWaitOnRenderPath,
 }
 
@@ -299,12 +300,27 @@ impl Error {
     }
 
     /// A fallible async factory returned `source` instead of an instance.
+    /// When `source` or an error in its `source()` chain is a
+    /// `LiveWaitOnRenderPath` refusal, the kind stays `LiveWaitOnRenderPath`.
     pub fn factory_failed(
         type_name: &str,
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     ) -> Self {
+        let refused_on_render_path =
+            std::iter::successors(Some(&*source as &(dyn std::error::Error + 'static)), |e| {
+                e.source()
+            })
+            .any(|e| {
+                e.downcast_ref::<Error>()
+                    .is_some_and(|e| e.kind == ErrorKind::LiveWaitOnRenderPath)
+            });
+        let kind = if refused_on_render_path {
+            ErrorKind::LiveWaitOnRenderPath
+        } else {
+            ErrorKind::FactoryFailed
+        };
         let mut error = Self::new(
-            ErrorKind::FactoryFailed,
+            kind,
             format!("Factory for type {} failed: {}", type_name, source),
         );
         error.source = Some(Arc::from(source));

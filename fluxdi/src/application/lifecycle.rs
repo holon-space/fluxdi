@@ -117,11 +117,18 @@ impl Application {
 
     /// Executes module `on_stop()` hooks in reverse startup order.
     ///
+    /// With the `live` feature, it first calls
+    /// [`Injector::shutdown_live`](crate::Injector::shutdown_live) on the root
+    /// injector, so an `on_stop` that waits for a live dependency sees
+    /// `LiveProducerCancelled` instead of waiting for ever.
+    ///
     /// If one or more modules fail during shutdown, all modules are still
     /// attempted, and a single aggregated error is returned listing every failure.
     pub async fn shutdown(&mut self) -> Result<(), Error> {
         #[cfg(feature = "tracing")]
         info!("Starting async application shutdown process");
+
+        Self::end_live_production(&self.injector);
 
         let mut shutdown_errors = Vec::new();
 
@@ -154,7 +161,8 @@ impl Application {
     /// Shutdown with options (e.g. timeout).
     ///
     /// When the `lifecycle` feature is enabled and `options.timeout` is `Some`,
-    /// the shutdown uses a graceful timeout: each module's `on_stop` is attempted
+    /// the shutdown uses a graceful timeout: live production ends first, as in
+    /// [`shutdown`](Self::shutdown), then each module's `on_stop` is attempted
     /// within the remaining time budget. All modules are always attempted (no
     /// partial abort); timeouts and failures are aggregated into a single error.
     #[allow(unused_variables)]
@@ -178,6 +186,8 @@ impl Application {
             "Starting async application shutdown process (timeout: {:?})",
             duration
         );
+
+        Self::end_live_production(&self.injector);
 
         let deadline = Instant::now() + duration;
         let mut shutdown_errors = Vec::new();
@@ -219,6 +229,15 @@ impl Application {
             Err(Error::shutdown_aggregate(shutdown_errors))
         }
     }
+
+    /// Runs before every `on_stop`, at shutdown and at bootstrap rollback.
+    #[cfg(feature = "live")]
+    pub(super) fn end_live_production(root: &Injector) {
+        root.shutdown_live();
+    }
+
+    #[cfg(not(feature = "live"))]
+    pub(super) fn end_live_production(_: &Injector) {}
 
     /// Backward-compatible alias for startup.
     pub async fn start(&mut self) -> Result<(), Error> {

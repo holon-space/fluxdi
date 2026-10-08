@@ -253,6 +253,45 @@ async fn a_hard_resolve_inside_a_non_blocking_scope_is_refused_only_when_it_woul
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_factory_refused_inside_a_non_blocking_scope_keeps_the_refusal_kind() {
+    struct Composite;
+    struct Outer;
+    let injector = Injector::root();
+    injector.provide::<Db>(gated_db(Arc::new(Notify::new())));
+    injector.provide::<Composite>(Provider::root_try_async(|inj: Injector| async move {
+        inj.try_resolve_live::<Db>()?.ready().await?;
+        Ok::<_, Error>(Shared::new(Composite))
+    }));
+    injector.provide::<Outer>(Provider::root_try_async(|inj: Injector| async move {
+        inj.try_resolve_async::<Composite>().await?;
+        Ok::<_, Error>(Shared::new(Outer))
+    }));
+    injector.resolve_live::<Db>();
+
+    for error in [
+        timeout(
+            HANG,
+            non_blocking_scope(injector.try_resolve_async::<Composite>()),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap(),
+        timeout(
+            HANG,
+            non_blocking_scope(injector.try_resolve_async::<Outer>()),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap(),
+    ] {
+        assert_refused(&error, "Db");
+        assert!(error.message.contains("Composite"), "{error}");
+    }
+}
+
 #[test]
 fn a_producer_polled_inside_a_non_blocking_section_may_wait() {
     #[derive(Debug)]
