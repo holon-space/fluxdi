@@ -453,3 +453,33 @@ fn concurrent_resolves_sharing_a_dependency_inside_a_factory_share_its_run() {
 
     assert_eq!(runs.load(Ordering::SeqCst), 1, "Svc's factory ran twice");
 }
+
+trait Named: Send + Sync {
+    fn name(&self) -> usize;
+}
+
+impl Named for Svc {
+    fn name(&self) -> usize {
+        self.0
+    }
+}
+
+async fn resolve_through_a_borrowed_injector(injector: &Injector) -> usize {
+    match injector.optional_resolve_async::<dyn Named>().await {
+        Some(named) => named.name(),
+        None => injector.resolve_async::<Svc>().await.0,
+    }
+}
+
+#[test]
+fn a_factory_may_await_a_resolve_through_a_borrowed_injector() {
+    let injector = Injector::root();
+    injector.provide::<dyn Named>(Provider::root_async(|_| async {
+        Shared::new(Svc(1)) as Shared<dyn Named>
+    }));
+    injector.provide::<usize>(Provider::root_async(|resolver| async move {
+        let first = resolver.resolve_async::<dyn Named>().await.name();
+        Shared::new(first + resolve_through_a_borrowed_injector(&resolver).await)
+    }));
+    assert_eq!(*within(injector.resolve_async::<usize>()), 2);
+}

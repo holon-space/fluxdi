@@ -1318,3 +1318,269 @@ fn concurrent_registrations_while_sets_resolve_and_follow_lose_no_slot() {
         .unwrap();
     assert_eq!(hard.len(), MEMBERS);
 }
+
+/// Waits on `X` once `gate` opens, then joins its set as `name`.
+fn waits_on<X: Send + Sync + 'static>(
+    name: &'static str,
+    gate: Arc<Notify>,
+) -> Provider<dyn Source> {
+    Provider::root_try_async(move |inj: Injector| {
+        let gate = gate.clone();
+        async move {
+            gate.notified().await;
+            inj.try_resolve_live::<X>()?.ready().await?;
+            Ok::<_, Error>(Shared::new(NamedSource(name)) as Shared<dyn Source>)
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completing_a_set_whose_member_waits_on_the_caller_is_a_cycle() {
+    #[derive(Debug)]
+    struct X;
+    let open = Arc::new(Notify::new());
+    open.notify_one();
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(waits_on::<X>("m", open));
+    injector.provide::<X>(Provider::root_try_async(|inj: Injector| async move {
+        inj.resolve_all_live::<dyn Source>().complete().await?;
+        Ok::<_, Error>(Shared::new(X))
+    }));
+
+    let error = timeout(HANG, injector.resolve_live::<X>().ready())
+        .await
+        .expect("X awaits complete() of a set whose member waits on X: hung")
+        .unwrap_err();
+    assert!(
+        error_kinds(&error).contains(&ErrorKind::CircularDependency),
+        "{error}"
+    );
+    assert_eq!(injector.recorded_waits(), vec![]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cycle_refused_on_a_member_fails_complete_while_other_members_still_run() {
+    #[derive(Debug)]
+    struct X;
+    let org = Arc::new(Notify::new());
+    let m = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(gated_source("org", org.clone()));
+    injector.provide_into_set::<dyn Source>(waits_on::<X>("m", m.clone()));
+    injector.provide::<X>(Provider::root_try_async(move |inj: Injector| {
+        let m = m.clone();
+        async move {
+            let mut complete = Box::pin(inj.resolve_all_live::<dyn Source>().complete());
+            assert!(futures::poll!(&mut complete).is_pending());
+            m.notify_one();
+            complete.await?;
+            Ok::<_, Error>(Shared::new(X))
+        }
+    }));
+
+    let set = injector.resolve_all_live::<dyn Source>();
+    let error = timeout(HANG, injector.resolve_live::<X>().ready())
+        .await
+        .expect("X completes a set whose member m waits on X, while org runs: hung")
+        .unwrap_err();
+    let cycle = std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |e| {
+        e.source()
+    })
+    .filter_map(|e| e.downcast_ref::<Error>())
+    .find(|e| e.kind == ErrorKind::CircularDependency)
+    .unwrap_or_else(|| panic!("X failed without a cycle: {error}"));
+    assert!(
+        cycle.message.contains(std::any::type_name::<X>())
+            && cycle.message.contains(std::any::type_name::<dyn Source>()),
+        "{cycle}"
+    );
+    assert_eq!(label(&set.members()[0]), (1, "pending"));
+}
+
+/// Slot 0 ends generation 1 while `complete()` waits on slot 1, then
+/// restarts; `poll_between` polls `complete()` between the end and the
+/// restart.
+async fn complete_across_a_restart(poll_between: bool) -> Vec<(u64, &'static str)> {
+    let first = Arc::new(Notify::new());
+    let blocker = Arc::new(Notify::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(Provider::root_async({
+        let first = first.clone();
+        move |_| {
+            let first = first.clone();
+            let run = runs.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if run == 0 {
+                    first.notified().await;
+                    Shared::new(NamedSource("gen1")) as Shared<dyn Source>
+                } else {
+                    std::future::pending().await
+                }
+            }
+        }
+    }));
+    injector.provide_into_set::<dyn Source>(gated_source("blocker", blocker.clone()));
+    let mut set = injector.resolve_all_live::<dyn Source>();
+    let mut complete = Box::pin(set.complete());
+    assert!(futures::poll!(&mut complete).is_pending());
+
+    first.notify_one();
+    timeout(HANG, async {
+        while label(&set.changed().await[0]) != (1, "ready") {}
+    })
+    .await
+    .expect("slot 0 never ended generation 1");
+    if poll_between {
+        assert!(futures::poll!(&mut complete).is_pending());
+    }
+    assert_eq!(set.restart(0).unwrap().get(), 2);
+    assert_eq!(label(&set.members()[0]), (2, "pending"));
+    blocker.notify_one();
+
+    timeout(HANG, complete)
+        .await
+        .expect("complete() waited for a generation started after the call")
+        .unwrap()
+        .iter()
+        .map(|member| (member.generation.get(), member.value.name()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_returns_the_generation_each_member_had_at_the_call() {
+    assert_eq!(
+        complete_across_a_restart(false).await,
+        vec![(1, "gen1"), (1, "blocker")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_polled_before_a_restart_returns_the_same_generation() {
+    assert_eq!(
+        complete_across_a_restart(true).await,
+        vec![(1, "gen1"), (1, "blocker")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_set_completes_at_once_without_a_wait() {
+    struct Probe {
+        completed_at_once: Option<usize>,
+        waits_before: Vec<(&'static str, &'static str)>,
+        waits_after: Vec<(&'static str, &'static str)>,
+    }
+    let injector = Injector::root();
+    injector.provide::<Probe>(Provider::root_try_async(|inj: Injector| async move {
+        let waits_before = inj.recorded_waits();
+        let completed_at_once =
+            futures::FutureExt::now_or_never(inj.resolve_all_live::<dyn Source>().complete())
+                .transpose()?
+                .map(|members| members.len());
+        Ok::<_, Error>(Shared::new(Probe {
+            completed_at_once,
+            waits_before,
+            waits_after: inj.recorded_waits(),
+        }))
+    }));
+
+    let probe = timeout(HANG, injector.resolve_live::<Probe>().ready())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.value.completed_at_once, Some(0));
+    assert_eq!(probe.value.waits_after, probe.value.waits_before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_complete_leaves_no_wait_behind() {
+    struct X {
+        waits_while_pending: Vec<(&'static str, &'static str)>,
+        waits_after_drop: Vec<(&'static str, &'static str)>,
+    }
+    let m = Arc::new(Notify::new());
+    let x_gate = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(waits_on::<X>("m", m.clone()));
+    injector.provide::<X>(Provider::root_try_async({
+        let x_gate = x_gate.clone();
+        move |inj: Injector| {
+            let m = m.clone();
+            let x_gate = x_gate.clone();
+            async move {
+                let mut complete = Box::pin(inj.resolve_all_live::<dyn Source>().complete());
+                assert!(futures::poll!(&mut complete).is_pending());
+                let waits_while_pending = inj.recorded_waits();
+                drop(complete);
+                let waits_after_drop = inj.recorded_waits();
+                m.notify_one();
+                x_gate.notified().await;
+                Ok::<_, Error>(Shared::new(X {
+                    waits_while_pending,
+                    waits_after_drop,
+                }))
+            }
+        }
+    }));
+
+    let set = injector.resolve_all_live::<dyn Source>();
+    let x = injector.resolve_live::<X>();
+    let m_waits_on_x = (
+        std::any::type_name::<dyn Source>(),
+        std::any::type_name::<X>(),
+    );
+    let x_waits_on_m = (m_waits_on_x.1, m_waits_on_x.0);
+    timeout(HANG, async {
+        while !injector.recorded_waits().contains(&m_waits_on_x)
+            && label(&set.members()[0]) == (1, "pending")
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("m neither waited on X nor failed");
+    x_gate.notify_one();
+
+    let x = timeout(HANG, x.ready()).await.unwrap().unwrap();
+    let names: Vec<&str> = timeout(HANG, set.complete())
+        .await
+        .unwrap()
+        .expect("m's wait on X was refused by the dropped complete()'s edge")
+        .iter()
+        .map(|member| member.value.name())
+        .collect();
+    assert_eq!(names, vec!["m"]);
+    assert!(x.value.waits_while_pending.contains(&x_waits_on_m));
+    assert!(!x.value.waits_after_drop.contains(&x_waits_on_m));
+}
+
+/// A live cell's receiver offers no `wait_for` outside `live/channel.rs`, so
+/// this scan covers the raw waits that remain.
+#[test]
+fn every_wait_for_a_run_to_end_records_a_wait_edge() {
+    let mut raw_waits = 0;
+    for (file, source) in [
+        ("live.rs", include_str!("../live.rs")),
+        ("live/channel.rs", include_str!("channel.rs")),
+        ("injector/cells.rs", include_str!("../injector/cells.rs")),
+        (
+            "injector/live_cells.rs",
+            include_str!("../injector/live_cells.rs"),
+        ),
+    ] {
+        let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for (number, line) in code.lines().enumerate() {
+            for raw in [".wait_for(", "Join {"] {
+                if let Some(at) = line.find(raw) {
+                    raw_waits += 1;
+                    assert!(
+                        line[..at].contains(".wait("),
+                        "{file}:{}: `{raw}` is not awaited through WaitEdge::wait: {line}",
+                        number + 1
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(raw_waits, 2, "the scan no longer sees the run-end waits");
+}

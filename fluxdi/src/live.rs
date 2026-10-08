@@ -22,6 +22,10 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+mod channel;
+pub(crate) use channel::CellReceiver;
+use channel::RunEnd;
+
 use crate::error::Error;
 use crate::injector::cells::{CellRegistry, RunRef};
 use crate::injector::live_cells::Starter;
@@ -42,6 +46,7 @@ pub(crate) struct CellState<T: ?Sized> {
     /// The producer of `generation`.
     pub(crate) producer: RunRef,
     pub(crate) state: LiveState<T>,
+    end: RunEnd<T>,
 }
 
 impl<T: ?Sized> Clone for CellState<T> {
@@ -50,19 +55,39 @@ impl<T: ?Sized> Clone for CellState<T> {
             generation: self.generation,
             producer: self.producer,
             state: self.state.clone(),
+            end: self.end.clone(),
         }
     }
 }
 
 impl<T: ?Sized> CellState<T> {
+    pub(crate) fn new(generation: Generation, producer: RunRef, state: LiveState<T>) -> Self {
+        Self {
+            generation,
+            producer,
+            end: RunEnd::new(&state),
+            state,
+        }
+    }
+
+    /// Ends this generation with the terminal `state`.
+    pub(crate) fn finish(&mut self, state: LiveState<T>) {
+        self.end.publish(&state);
+        self.state = state;
+    }
+
     fn observed(&self) -> Generational<LiveState<T>> {
         Generational::new(self.generation, self.state.clone())
     }
 }
 
 /// Reads and waits on one live cell; restarting is up to [`Live`].
+///
+/// Every wait for a producer to end goes through [`CellWatch::settle`],
+/// which records it in the wait-for graph. `changed()` records nothing: it
+/// observes the next state and does not wait for a producer to end.
 pub(crate) struct CellWatch<T: ?Sized> {
-    rx: watch::Receiver<CellState<T>>,
+    rx: CellReceiver<T>,
     /// Holds the cell's sender, so `rx` never sees the channel closed.
     registry: Shared<CellRegistry>,
 }
@@ -78,33 +103,44 @@ impl<T: ?Sized> Clone for CellWatch<T> {
 
 impl<T: ?Sized + Send + Sync + 'static> CellWatch<T> {
     pub(crate) fn new(rx: watch::Receiver<CellState<T>>, registry: Shared<CellRegistry>) -> Self {
-        Self { rx, registry }
-    }
-
-    /// Waits for a terminal state of the newest generation seen, and records
-    /// the wait on that generation's producer in the wait-for graph.
-    pub(crate) async fn ready(&self) -> Result<Generational<Shared<T>>, Error> {
-        self.settle(true).await
-    }
-
-    async fn settle(&self, record_wait: bool) -> Result<Generational<Shared<T>>, Error> {
-        let mut rx = self.rx.clone();
-        let mut current = rx.borrow_and_update().clone();
-        while !is_terminal(&current.state) {
-            let _wait = record_wait
-                .then(|| self.registry.begin_wait(current.producer))
-                .transpose()?;
-            let generation = current.generation;
-            current = rx
-                .wait_for(|cell| cell.generation != generation || is_terminal(&cell.state))
-                .await
-                .expect("the registry keeps a live cell's sender")
-                .clone();
+        Self {
+            rx: CellReceiver::new(rx),
+            registry,
         }
-        match current.state {
-            LiveState::Ready(value) => Ok(Generational::new(current.generation, value)),
-            LiveState::Failed(error) => Err(error),
-            _ => unreachable!("the loop ends on a terminal state"),
+    }
+
+    /// The outcome of the newest generation seen when the wait ends.
+    pub(crate) async fn ready(&self) -> Result<Generational<Shared<T>>, Error> {
+        loop {
+            let generation = self.rx.borrow().generation;
+            let outcome = self.settle().await?;
+            if self.rx.borrow().generation == generation {
+                return outcome;
+            }
+        }
+    }
+
+    /// Waits for the terminal state of the generation current at the call,
+    /// with a wait edge on its producer while it runs. The outer `Err` is a
+    /// refused wait (`CircularDependency`); the inner result is the outcome.
+    fn settle(
+        &self,
+    ) -> impl Future<Output = Result<Result<Generational<Shared<T>>, Error>, Error>> + Send + 'static
+    {
+        let registry = self.registry.clone();
+        let current = self.rx.borrow().clone();
+        async move {
+            let state = if is_terminal(&current.state) {
+                current.state
+            } else {
+                let edge = registry.begin_wait(current.producer)?;
+                current.end.wait(edge).await?
+            };
+            Ok(match state {
+                LiveState::Ready(value) => Ok(Generational::new(current.generation, value)),
+                LiveState::Failed(error) => Err(error),
+                _ => unreachable!("a generation ends in a terminal state"),
+            })
         }
     }
 }
@@ -223,12 +259,11 @@ impl<T: ?Sized + Send + Sync + 'static> Live<T> {
     /// Waits for the newest state after the last one this handle saw. States
     /// that were replaced before this handle looked are skipped; a jump in
     /// the generation shows that one was.
+    ///
+    /// An observation, not a wait for the producer to end: the wait-for graph
+    /// does not see it, so a cycle through `changed()` is not refused.
     pub async fn changed(&mut self) -> Generational<LiveState<T>> {
-        self.watch
-            .rx
-            .changed()
-            .await
-            .expect("the registry keeps a live cell's sender");
+        self.watch.rx.changed().await;
         self.watch.rx.borrow_and_update().observed()
     }
 
@@ -323,7 +358,8 @@ impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
 
     /// Waits for the next change after the last states this handle saw: a
     /// member's state, or a new slot (which starts in generation 1). Returns
-    /// every slot's state.
+    /// every slot's state. Like [`Live::changed`], an observation the
+    /// wait-for graph does not see.
     pub async fn changed(&mut self) -> Vec<Generational<LiveState<T>>> {
         if self.seen.is_empty() {
             self.slots
@@ -341,9 +377,7 @@ impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
                 futures::future::Either::Left((grown, _)) => {
                     grown.expect("a live set holds its membership sender")
                 }
-                futures::future::Either::Right(((changed, _, _), _)) => {
-                    changed.expect("the registry keeps a live cell's sender")
-                }
+                futures::future::Either::Right(_) => {}
             }
         }
         let slots = self.slots.borrow_and_update().clone();
@@ -354,18 +388,23 @@ impl<T: ?Sized + Send + Sync + 'static> LiveSet<T> {
             .collect()
     }
 
-    /// Waits until the newest generation of every slot present at the call
-    /// is terminal; a slot added meanwhile is not waited for. Fails with the
-    /// first failed member's error, in slot order.
+    /// Waits until every slot present at the call ends the generation it
+    /// had at the call; a slot added or a generation restarted later is not
+    /// waited for. Fails with the first failed member's error, in slot order.
+    ///
+    /// Waits on every unfinished member at once, so it fails at once with
+    /// `CircularDependency` when a cycle closes through one of these waits,
+    /// on either side.
     pub fn complete(
         &self,
     ) -> impl Future<Output = Result<Vec<Generational<Shared<T>>>, Error>> + Send + 'static {
-        let members = self.snapshot();
+        let settles: Vec<_> = self
+            .snapshot()
+            .iter()
+            .map(|member| member.watch.settle())
+            .collect();
         async move {
-            let mut outcomes = Vec::with_capacity(members.len());
-            for member in &members {
-                outcomes.push(member.watch.settle(false).await);
-            }
+            let outcomes = futures::future::try_join_all(settles).await?;
             outcomes.into_iter().collect()
         }
     }

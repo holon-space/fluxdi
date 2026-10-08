@@ -182,11 +182,7 @@ impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
                 is_terminal(&cell.state),
                 "only a restart ends a terminal generation"
             );
-            *cell = CellState {
-                generation,
-                producer,
-                state: LiveState::Pending,
-            };
+            *cell = CellState::new(generation, producer, LiveState::Pending);
         });
         registry.spawn_producer(
             producers,
@@ -363,7 +359,7 @@ impl<T: ?Sized> Reporter<T> {
                 cell.generation, self.generation,
                 "a generation stays newest until its producer reports"
             );
-            cell.state = state;
+            cell.finish(state);
         });
         self.registry.live.bump_report();
     }
@@ -662,12 +658,7 @@ impl Injector {
                     }
                 };
                 let state: Publish<T> = Shared::new(
-                    watch::channel(CellState {
-                        generation: Generation::FIRST,
-                        producer,
-                        state: initial,
-                    })
-                    .0,
+                    watch::channel(CellState::new(Generation::FIRST, producer, initial)).0,
                 );
                 if observed {
                     cells.insert(

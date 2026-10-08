@@ -8,7 +8,9 @@
 //!
 //! Joining is a wait across resolution paths, which `ResolveGuard` cannot
 //! see. The registry therefore keeps a wait-for graph between runs and
-//! refuses a wait that would close a cycle with `CircularDependency`.
+//! refuses a wait that would close a cycle with `CircularDependency`. The
+//! waits already on that cycle fail with it too, so neither side of a cycle
+//! is left waiting.
 
 use std::any::Any;
 use std::cell::Cell as LocalCell;
@@ -171,8 +173,7 @@ struct RunEntry {
 #[derive(Default)]
 pub(crate) struct CellRegistry {
     runs: Mutex<HashMap<CellKey, RunEntry>>,
-    /// `(waiter, awaited)`: the factory of `waiter` awaits the run `awaited`.
-    waits: Mutex<Vec<(RunRef, RunRef)>>,
+    waits: Mutex<Vec<Wait>>,
     #[cfg(feature = "live")]
     pub(super) live: super::live_cells::LiveCells,
 }
@@ -236,23 +237,48 @@ impl CellRegistry {
         let Some(waiter) = future_local::current(&CURRENT_RUN) else {
             return Ok(WaitEdge {
                 registry: self,
-                edge: None,
+                wait: None,
             });
         };
         let mut waits = self.waits.lock().expect("cell wait mutex poisoned");
         let mut path = Vec::new();
         if wait_path(&waits, awaited, waiter, &mut path) {
             let names: Vec<&str> = std::iter::once(waiter)
-                .chain(path)
+                .chain(path.iter().copied())
                 .map(|run| run.type_name)
                 .collect();
-            return Err(Error::circular_dependency(&names));
+            let error = Error::circular_dependency(&names);
+            for wait in waits.iter() {
+                if path
+                    .windows(2)
+                    .any(|edge| edge == [wait.waiter, wait.awaited])
+                {
+                    wait.refusal.refuse(&error);
+                }
+            }
+            return Err(error);
         }
-        waits.push((waiter, awaited));
+        let wait = Wait {
+            waiter,
+            awaited,
+            refusal: Shared::new(Refusal::default()),
+        };
+        waits.push(wait.clone());
         Ok(WaitEdge {
             registry: self,
-            edge: Some((waiter, awaited)),
+            wait: Some(wait),
         })
+    }
+
+    /// `(waiter, awaited)` type names of every recorded wait.
+    #[cfg(all(test, feature = "live"))]
+    pub(crate) fn recorded_waits(&self) -> Vec<(&'static str, &'static str)> {
+        self.waits
+            .lock()
+            .expect("cell wait mutex poisoned")
+            .iter()
+            .map(|wait| (wait.waiter.type_name, wait.awaited.type_name))
+            .collect()
     }
 
     #[cfg(test)]
@@ -301,14 +327,89 @@ impl<T: ?Sized + CellValue> Drop for Driver<T> {
     }
 }
 
+/// The factory of `waiter` awaits the run `awaited`.
+#[derive(Clone)]
+struct Wait {
+    waiter: RunRef,
+    awaited: RunRef,
+    refusal: Shared<Refusal>,
+}
+
+/// Set when a refused wait closes a cycle through this wait.
+#[derive(Default)]
+struct Refusal {
+    state: Mutex<RefusalState>,
+}
+
+#[derive(Default)]
+struct RefusalState {
+    error: Option<Error>,
+    waiter: Option<Waker>,
+}
+
+impl Refusal {
+    fn refuse(&self, error: &Error) {
+        let waiter = {
+            let mut state = self.state.lock().expect("refusal mutex poisoned");
+            state.error.get_or_insert_with(|| error.clone());
+            state.waiter.take()
+        };
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Error> {
+        let mut state = self.state.lock().expect("refusal mutex poisoned");
+        match &state.error {
+            Some(error) => Poll::Ready(error.clone()),
+            None => {
+                state.waiter = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// A recorded wait; the only way to await the end of another run.
 pub(crate) struct WaitEdge<'a> {
     registry: &'a CellRegistry,
-    edge: Option<(RunRef, RunRef)>,
+    /// `None` when no run is being polled, so nothing is recorded.
+    wait: Option<Wait>,
+}
+
+impl<'a> WaitEdge<'a> {
+    /// Awaits `run_end`, or fails with `CircularDependency` once a refused
+    /// wait closes a cycle through this one.
+    pub(crate) fn wait<F: Future + Unpin>(&self, run_end: F) -> EdgeWait<'_, 'a, F> {
+        EdgeWait {
+            edge: self,
+            run_end,
+        }
+    }
+}
+
+pub(crate) struct EdgeWait<'e, 'a, F> {
+    edge: &'e WaitEdge<'a>,
+    run_end: F,
+}
+
+impl<F: Future + Unpin> Future for EdgeWait<'_, '_, F> {
+    type Output = Result<F::Output, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(wait) = &self.edge.wait
+            && let Poll::Ready(error) = wait.refusal.poll(cx)
+        {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.run_end).poll(cx).map(Ok)
+    }
 }
 
 impl Drop for WaitEdge<'_> {
     fn drop(&mut self) {
-        let Some(edge) = self.edge else {
+        let Some(wait) = &self.wait else {
             return;
         };
         let mut waits = self
@@ -318,7 +419,7 @@ impl Drop for WaitEdge<'_> {
             .expect("cell wait mutex poisoned");
         let position = waits
             .iter()
-            .position(|recorded| *recorded == edge)
+            .position(|recorded| Shared::ptr_eq(&recorded.refusal, &wait.refusal))
             .expect("a wait edge stays recorded until its guard drops");
         waits.swap_remove(position);
     }
@@ -326,13 +427,16 @@ impl Drop for WaitEdge<'_> {
 
 /// Whether `from` reaches `to` along recorded waits; on success `path` holds
 /// the runs from `from` to `to`.
-fn wait_path(waits: &[(RunRef, RunRef)], from: RunRef, to: RunRef, path: &mut Vec<RunRef>) -> bool {
+fn wait_path(waits: &[Wait], from: RunRef, to: RunRef, path: &mut Vec<RunRef>) -> bool {
     path.push(from);
     if from == to {
         return true;
     }
-    for &(waiter, awaited) in waits {
-        if waiter == from && !path.contains(&awaited) && wait_path(waits, awaited, to, path) {
+    for wait in waits {
+        if wait.waiter == from
+            && !path.contains(&wait.awaited)
+            && wait_path(waits, wait.awaited, to, path)
+        {
             return true;
         }
     }
@@ -341,6 +445,11 @@ fn wait_path(waits: &[(RunRef, RunRef)], from: RunRef, to: RunRef, path: &mut Ve
 }
 
 impl Injector {
+    #[cfg(all(test, feature = "live"))]
+    pub(crate) fn recorded_waits(&self) -> Vec<(&'static str, &'static str)> {
+        self.inner.cells.recorded_waits()
+    }
+
     /// Resolves a cached binding through its cell in `key`; `produce` runs
     /// the factory and stores the instance in the cache. A live cell of
     /// `key` takes precedence: the resolve waits for its producer.
@@ -390,8 +499,8 @@ impl Injector {
                     return result;
                 }
                 Cell::Join(run, cell) => {
-                    let _edge = registry.begin_wait(run)?;
-                    match (Join { cell }).await {
+                    let edge = registry.begin_wait(run)?;
+                    match edge.wait(Join { cell }).await? {
                         Outcome::Done(result) => return result,
                         Outcome::Abandoned => continue,
                     }
