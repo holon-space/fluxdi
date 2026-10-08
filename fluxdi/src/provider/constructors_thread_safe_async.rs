@@ -118,7 +118,11 @@ impl<T: ?Sized + 'static> Provider<T> {
         Self::try_async_with_scope(Scope::Scoped, factory)
     }
 
-    fn try_async_with_scope<F, Fut, E>(scope: Scope, factory: F) -> Provider<T>
+    pub(crate) fn async_run(&self, injector: Injector) -> Option<AsyncRun<T>> {
+        self.async_factory.as_ref().map(|factory| factory(injector))
+    }
+
+    pub(super) fn try_async_with_scope<F, Fut, E>(scope: Scope, factory: F) -> Provider<T>
     where
         F: Fn(Injector) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Shared<T>, E>> + Send + 'static,
@@ -157,6 +161,8 @@ impl<T: ?Sized + 'static> Provider<T> {
                     }
                 })
             })),
+            #[cfg(feature = "live")]
+            live_factory: None,
             limits: Limits::default(),
             dependency_hints: Vec::new(),
             limiter: None,

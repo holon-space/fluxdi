@@ -13,6 +13,10 @@
 //! A hard resolve returns the value of the last `Ready` generation and never
 //! waits for a restart; to follow restarts, hold a [`Live`] and check
 //! [`Live::is_current`].
+//!
+//! The factory of a live provider gets a [`LivePublisher`] and may publish
+//! `Partial` values before it returns. Only a live handle's state shows
+//! them; `ready()` and hard resolves wait for the final value.
 
 use std::time::Duration;
 
@@ -102,6 +106,65 @@ impl<T: ?Sized + Send + Sync + 'static> CellWatch<T> {
             LiveState::Failed(error) => Err(error),
             _ => unreachable!("the loop ends on a terminal state"),
         }
+    }
+}
+
+/// Lets the factory of a live provider (`Provider::root_live` and its
+/// siblings) publish usable but incomplete values while it runs. A partial
+/// never completes a [`Live::ready`] or a hard resolve; those return only
+/// the factory's final value.
+///
+/// A publisher belongs to one generation of one live cell and must not
+/// outlive its factory run: publishing after that generation ended, by
+/// returning, failing, being cancelled, or being followed by a restart, is
+/// a programming error and panics.
+pub struct LivePublisher<T: ?Sized + 'static> {
+    /// `None` when no live cell observes the run, as in a hard resolve that
+    /// started it.
+    cell: Option<(Shared<watch::Sender<CellState<T>>>, Generation)>,
+}
+
+impl<T: ?Sized + 'static> LivePublisher<T> {
+    pub(crate) fn new(cell: Shared<watch::Sender<CellState<T>>>, generation: Generation) -> Self {
+        Self {
+            cell: Some((cell, generation)),
+        }
+    }
+
+    pub(crate) fn unobserved() -> Self {
+        Self { cell: None }
+    }
+
+    /// Publishes `value` as the `Partial` state of this publisher's
+    /// generation, replacing an earlier partial.
+    pub fn partial(&self, value: Shared<T>) {
+        let Some((cell, generation)) = &self.cell else {
+            return;
+        };
+        let mut newest = *generation;
+        let mut ended = false;
+        cell.send_if_modified(|cell| {
+            newest = cell.generation;
+            ended = is_terminal(&cell.state);
+            if newest != *generation || ended {
+                return false;
+            }
+            cell.state = LiveState::Partial(value);
+            true
+        });
+        let type_name = std::any::type_name::<T>();
+        assert_eq!(
+            newest,
+            *generation,
+            "a live publisher of {type_name} generation {} published after generation {} started",
+            generation.get(),
+            newest.get()
+        );
+        assert!(
+            !ended,
+            "a live publisher of {type_name} generation {} published after its producer ended",
+            generation.get()
+        );
     }
 }
 

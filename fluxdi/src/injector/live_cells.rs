@@ -24,12 +24,13 @@ use super::cells::{CURRENT_RUN, CellRegistry, RunRef};
 use super::*;
 use crate::future_local::WithLocal;
 use crate::live::{
-    CellState, CellWatch, Generation, Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState,
-    LiveTiming, is_terminal,
+    CellState, CellWatch, Generation, Live, LiveOutcome, LivePublisher, LiveReportChanges, LiveSet,
+    LiveState, LiveTiming, is_terminal,
 };
 
 type Publish<T> = Shared<watch::Sender<CellState<T>>>;
 type CachedLookup<T> = Box<dyn Fn(&Injector) -> Option<Shared<Instance<T>>> + Send + Sync>;
+type Produce<T> = Box<dyn Fn(Injector, Injector, LivePublisher<T>) -> RunFuture<T> + Send + Sync>;
 
 /// The live part of a [`CellRegistry`].
 pub(crate) struct LiveCells {
@@ -114,9 +115,9 @@ pub(crate) struct Starter<T: ?Sized + 'static> {
     member: Option<usize>,
     state: Publish<T>,
     cached: CachedLookup<T>,
-    /// Runs the factory with `(resolver, target)` and stores the instance in
-    /// `target`'s cache.
-    produce: Box<dyn Fn(Injector, Injector) -> RunFuture<T> + Send + Sync>,
+    /// Runs the factory with `(resolver, target, publisher)` and stores the
+    /// instance in `target`'s cache.
+    produce: Produce<T>,
 }
 
 impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
@@ -157,7 +158,7 @@ impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
             self.member,
             generation,
             self.state.clone(),
-            self.run(producer, false, resolver.clone(), target),
+            self.run(producer, generation, false, resolver.clone(), target),
         );
         Ok(generation)
     }
@@ -167,6 +168,7 @@ impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
     fn run(
         self: &Shared<Self>,
         producer: RunRef,
+        generation: Generation,
         first: bool,
         resolver: Injector,
         target: Injector,
@@ -178,13 +180,17 @@ impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
             let cached = || first.then(|| (starter.cached)(&target)).flatten();
             let produce = || {
                 Box::pin(
-                    AssertUnwindSafe((starter.produce)(resolver.clone(), target.clone()))
-                        .catch_unwind()
-                        .map(|outcome| {
-                            outcome.unwrap_or_else(|panic| {
-                                Err(Error::factory_panicked(type_name, &panic_message(&*panic)))
-                            })
-                        }),
+                    AssertUnwindSafe((starter.produce)(
+                        resolver.clone(),
+                        target.clone(),
+                        LivePublisher::new(starter.state.clone(), generation),
+                    ))
+                    .catch_unwind()
+                    .map(|outcome| {
+                        outcome.unwrap_or_else(|panic| {
+                            Err(Error::factory_panicked(type_name, &panic_message(&*panic)))
+                        })
+                    }),
                 ) as RunFuture<T>
             };
             resolver.produce_in_cell(key, cached, produce).await
@@ -385,9 +391,13 @@ impl Injector {
             None,
             &target,
             |target: &Injector| target.get_instance::<T>(),
-            |injector: Injector, target: Injector| {
+            |injector: Injector, target: Injector, publisher: LivePublisher<T>| {
                 Box::pin(async move {
-                    let instance = injector.resolve_instance_async::<T>().await?;
+                    let instance = injector
+                        .resolve_instance_async_with::<T>(|provider, injector| {
+                            provider.live_run(injector, publisher)
+                        })
+                        .await?;
                     target.store_instance::<T>(instance.clone());
                     Ok(instance)
                 }) as RunFuture<T>
@@ -429,11 +439,14 @@ impl Injector {
                     Some(member),
                     &target,
                     move |target: &Injector| target.get_set_instance::<T>(&cached_provider),
-                    move |injector: Injector, target: Injector| {
+                    move |injector: Injector, target: Injector, publisher: LivePublisher<T>| {
                         let provider = provider.clone();
                         Box::pin(async move {
                             let instance = injector
-                                .resolve_instance_from_provider_async::<T>(&provider)
+                                .resolve_instance_from_provider_async_with::<T>(
+                                    &provider,
+                                    |provider, injector| provider.live_run(injector, publisher),
+                                )
                                 .await?;
                             target.store_set_instance::<T>(&provider, instance.clone());
                             Ok(instance)
@@ -497,7 +510,7 @@ impl Injector {
         member: Option<usize>,
         target: &Injector,
         cached: impl Fn(&Injector) -> Option<Shared<Instance<T>>> + Send + Sync + 'static,
-        produce: impl Fn(Injector, Injector) -> RunFuture<T> + Send + Sync + 'static,
+        produce: impl Fn(Injector, Injector, LivePublisher<T>) -> RunFuture<T> + Send + Sync + 'static,
     ) -> Result<Live<T>, Error>
     where
         T: ?Sized + Send + Sync + 'static,
@@ -560,7 +573,13 @@ impl Injector {
                 member,
                 Generation::FIRST,
                 state,
-                starter.run(producer, true, self.clone(), target.clone()),
+                starter.run(
+                    producer,
+                    Generation::FIRST,
+                    true,
+                    self.clone(),
+                    target.clone(),
+                ),
             );
         }
         Ok(live)

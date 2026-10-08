@@ -53,6 +53,11 @@ pub struct Provider<T: ?Sized + 'static> {
     #[cfg(feature = "async-factory")]
     pub async_factory: Option<AsyncFactory<T>>,
 
+    /// The factory a live producer runs with its cell's publisher; set only
+    /// by the `*_live` constructors.
+    #[cfg(feature = "live")]
+    pub(crate) live_factory: Option<LiveFactory<T>>,
+
     /// Optional resource limits for this provider factory.
     pub limits: Limits,
 

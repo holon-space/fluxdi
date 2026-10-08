@@ -73,13 +73,18 @@ type AsyncFactory<T> = Box<
 >;
 
 #[cfg(all(feature = "async-factory", feature = "thread-safe"))]
-type AsyncFactory<T> = Box<
-    dyn Fn(Injector) -> Pin<Box<dyn Future<Output = Result<Instance<T>, Error>> + Send + 'static>>
-        + Send
-        + Sync
-        + 'static,
->;
+pub(crate) type AsyncRun<T> =
+    Pin<Box<dyn Future<Output = Result<Instance<T>, Error>> + Send + 'static>>;
 
+#[cfg(all(feature = "async-factory", feature = "thread-safe"))]
+type AsyncFactory<T> = Box<dyn Fn(Injector) -> AsyncRun<T> + Send + Sync + 'static>;
+
+#[cfg(feature = "live")]
+type LiveFactory<T> =
+    Box<dyn Fn(Injector, crate::live::LivePublisher<T>) -> AsyncRun<T> + Send + Sync + 'static>;
+
+#[cfg(feature = "live")]
+mod constructors_live;
 #[cfg(all(not(feature = "thread-safe"), feature = "async-factory"))]
 mod constructors_non_thread_safe_async;
 #[cfg(not(feature = "thread-safe"))]

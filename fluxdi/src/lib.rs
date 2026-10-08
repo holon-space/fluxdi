@@ -33,7 +33,8 @@ pub use injector::*;
 pub use instance::*;
 #[cfg(feature = "live")]
 pub use live::{
-    Generation, Generational, Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState, LiveTiming,
+    Generation, Generational, Live, LiveOutcome, LivePublisher, LiveReportChanges, LiveSet,
+    LiveState, LiveTiming,
 };
 pub use module::*;
 pub use observability::*;

@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
-use crate::live::Generational;
+use crate::live::{Completeness, Generational, LivePublisher};
 use crate::{Error, ErrorKind, Injector, LiveOutcome, LiveState, Provider, Shared};
 
 const HANG: Duration = Duration::from_secs(5);
@@ -700,4 +700,252 @@ async fn a_set_restart_of_a_missing_slot_is_an_error() {
         "{}",
         error.message
     );
+}
+
+/// Publishes two pages as partials, then the complete value; each step waits
+/// for `gate`.
+fn paged_db(gate: Arc<Notify>) -> Provider<Db> {
+    Provider::root_live(move |_, publisher: LivePublisher<Db>| {
+        let gate = gate.clone();
+        async move {
+            for page in ["page 1", "page 2"] {
+                gate.notified().await;
+                publisher.partial(Shared::new(Db(page)));
+            }
+            gate.notified().await;
+            Ok::<_, std::io::Error>(Shared::new(Db("complete")))
+        }
+    })
+}
+
+type Seen = (
+    u64,
+    &'static str,
+    Option<&'static str>,
+    Option<Completeness>,
+);
+
+fn seen(state: &Generational<LiveState<Db>>) -> Seen {
+    let (generation, name) = label(state);
+    (
+        generation,
+        name,
+        state.value.value().map(|db| db.0),
+        state.value.completeness(),
+    )
+}
+
+fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+    match panic.downcast::<String>() {
+        Ok(text) => *text,
+        Err(panic) => panic
+            .downcast::<&'static str>()
+            .map(|text| text.to_string())
+            .expect("a panic with a text payload"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_observer_sees_every_partial_then_the_complete_value() {
+    let gate = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide::<Db>(paged_db(gate.clone()));
+
+    let live = injector.resolve_live::<Db>();
+    let mut observer = live.clone();
+    let mut states = vec![seen(&live.state())];
+    for _ in 0..3 {
+        gate.notify_one();
+        states.push(seen(&timeout(HANG, observer.changed()).await.unwrap()));
+    }
+    assert_eq!(
+        states,
+        vec![
+            (1, "pending", None, None),
+            (1, "partial", Some("page 1"), Some(Completeness::Partial)),
+            (1, "partial", Some("page 2"), Some(Completeness::Partial)),
+            (1, "ready", Some("complete"), Some(Completeness::Complete)),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn neither_ready_nor_a_hard_resolve_returns_a_partial() {
+    let gate = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide::<Db>(paged_db(gate.clone()));
+
+    let live = injector.resolve_live::<Db>();
+    let mut observer = live.clone();
+    let mut waiter = Box::pin(live.ready());
+    let mut hard = Box::pin(injector.try_resolve_async::<Db>());
+    for _ in 0..2 {
+        gate.notify_one();
+        let state = timeout(HANG, observer.changed()).await.unwrap();
+        assert_eq!(label(&state).1, "partial");
+        assert!(
+            futures::poll!(&mut waiter).is_pending(),
+            "ready() returned a partial"
+        );
+        assert!(
+            futures::poll!(&mut hard).is_pending(),
+            "a hard resolve returned a partial"
+        );
+    }
+
+    gate.notify_one();
+    let ready = timeout(HANG, waiter).await.unwrap().unwrap();
+    assert_eq!((ready.generation.get(), ready.value.0), (1, "complete"));
+    let hard = timeout(HANG, hard).await.unwrap().unwrap();
+    assert!(Shared::ptr_eq(&hard, &ready.value));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hard_resolve_without_a_live_handle_returns_the_complete_value() {
+    let injector = Injector::root();
+    injector.provide::<Db>(Provider::root_live(
+        |_, publisher: LivePublisher<Db>| async move {
+            publisher.partial(Shared::new(Db("page 1")));
+            Ok::<_, std::io::Error>(Shared::new(Db("complete")))
+        },
+    ));
+
+    let hard = timeout(HANG, injector.try_resolve_async::<Db>())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hard.0, "complete");
+    let live = injector.resolve_live::<Db>();
+    assert_eq!(seen(&live.state()).2, Some("complete"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_member_publishes_partials_in_its_slot() {
+    let gate = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(Provider::root(|_| {
+        Shared::new(NamedSource("org")) as Shared<dyn Source>
+    }));
+    injector.provide_into_set::<dyn Source>(Provider::root_live({
+        let gate = gate.clone();
+        move |_, publisher: LivePublisher<dyn Source>| {
+            let gate = gate.clone();
+            async move {
+                publisher.partial(Shared::new(NamedSource("mcp page 1")) as Shared<dyn Source>);
+                gate.notified().await;
+                Ok::<_, std::io::Error>(Shared::new(NamedSource("mcp")) as Shared<dyn Source>)
+            }
+        }
+    }));
+
+    let mut set = injector.resolve_all_live::<dyn Source>();
+    let partial = timeout(HANG, async {
+        loop {
+            let members = set.changed().await;
+            if let LiveState::Partial(source) = &members[1].value {
+                return source.name();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(partial, "mcp page 1");
+    assert_eq!(set.ready_members().len(), 1);
+
+    gate.notify_one();
+    let names: Vec<&str> = timeout(HANG, set.complete())
+        .await
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|member| member.value.name())
+        .collect();
+    assert_eq!(names, vec!["org", "mcp"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_publisher_cannot_write_into_the_next_generation() {
+    let gate = Arc::new(Notify::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let escaped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let injector = Injector::root();
+    injector.provide::<Db>(Provider::root_live({
+        let (gate, runs, escaped) = (gate.clone(), runs.clone(), escaped.clone());
+        move |_, publisher: LivePublisher<Db>| {
+            let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+            let (gate, escaped) = (gate.clone(), escaped.clone());
+            async move {
+                if run == 1 {
+                    escaped.lock().unwrap().push(publisher);
+                    return Ok::<_, std::io::Error>(Shared::new(Db("first")));
+                }
+                gate.notified().await;
+                Ok(Shared::new(Db("second")))
+            }
+        }
+    }));
+
+    let live = injector.resolve_live::<Db>();
+    timeout(HANG, live.ready()).await.unwrap().unwrap();
+    live.restart().unwrap();
+    assert_eq!(label(&live.state()), (2, "pending"));
+
+    let stale = escaped.lock().unwrap().pop().unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stale.partial(Shared::new(Db("stale")))
+    }))
+    .expect_err("a generation-1 publisher published into generation 2");
+    let text = panic_text(panic);
+    assert!(text.contains("generation 1"), "{text}");
+    assert_eq!(label(&live.state()), (2, "pending"));
+
+    gate.notify_one();
+    let ready = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    assert_eq!((ready.generation.get(), ready.value.0), (2, "second"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publish_after_the_producer_ended_is_a_programming_error() {
+    let escaped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let escaping_db = |forever: bool| {
+        let escaped = escaped.clone();
+        Provider::root_live(move |_, publisher: LivePublisher<Db>| {
+            let escaped = escaped.clone();
+            async move {
+                escaped.lock().unwrap().push(publisher);
+                if forever {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, std::io::Error>(Shared::new(Db("complete")))
+            }
+        })
+    };
+    let finished = Injector::root();
+    finished.provide::<Db>(escaping_db(false));
+    let cancelled = Injector::root();
+    cancelled.provide::<Db>(escaping_db(true));
+
+    let ready = finished.resolve_live::<Db>();
+    timeout(HANG, ready.ready()).await.unwrap().unwrap();
+    let running = cancelled.resolve_live::<Db>();
+    timeout(HANG, async {
+        while escaped.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cancelled.shutdown_live();
+    let error = timeout(HANG, running.ready()).await.unwrap().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+
+    for (publisher, live) in escaped.lock().unwrap().drain(..).zip([&ready, &running]) {
+        let before = label(&live.state());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publisher.partial(Shared::new(Db("late")))
+        }))
+        .expect_err("published after the producer ended");
+        assert!(panic_text(panic).contains("ended"));
+        assert_eq!(label(&live.state()), before);
+    }
 }

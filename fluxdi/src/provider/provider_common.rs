@@ -134,6 +134,8 @@ impl<T: ?Sized + 'static> Provider<T> {
             factory,
             #[cfg(feature = "async-factory")]
             async_factory,
+            #[cfg(feature = "live")]
+            live_factory,
             limits,
             dependency_hints,
             limiter,
@@ -146,6 +148,8 @@ impl<T: ?Sized + 'static> Provider<T> {
             }),
             #[cfg(feature = "async-factory")]
             async_factory,
+            #[cfg(feature = "live")]
+            live_factory,
             limits,
             dependency_hints,
             limiter,

@@ -179,6 +179,20 @@ impl Injector {
     where
         T: ?Sized + Send + Sync + 'static,
     {
+        self.resolve_instance_async_with::<T>(Provider::async_run)
+            .await
+    }
+
+    /// [`Self::resolve_instance_async`] with `run` choosing the provider's
+    /// async run; `None` falls back to the sync factory.
+    #[cfg(feature = "async-factory")]
+    pub(crate) async fn resolve_instance_async_with<T>(
+        &self,
+        run: impl FnOnce(&Provider<T>, Injector) -> Option<crate::provider::AsyncRun<T>>,
+    ) -> Result<Shared<Instance<T>>, Error>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
         #[cfg(feature = "metrics")]
         self.inner.metrics.record_factory_execution();
 
@@ -208,8 +222,8 @@ impl Injector {
                 "Async factory permit acquired"
             );
 
-            if let Some(async_factory) = &provider_ref.async_factory {
-                let instance = Shared::new((async_factory)(self.clone()).await?);
+            if let Some(run) = run(&provider_ref, self.clone()) {
+                let instance = Shared::new(run.await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
@@ -336,6 +350,21 @@ impl Injector {
     where
         T: ?Sized + Send + Sync + 'static,
     {
+        self.resolve_instance_from_provider_async_with(provider_ref, Provider::async_run)
+            .await
+    }
+
+    /// [`Self::resolve_instance_from_provider_async`] with `run` choosing the
+    /// provider's async run; `None` falls back to the sync factory.
+    #[cfg(feature = "async-factory")]
+    pub(crate) async fn resolve_instance_from_provider_async_with<T>(
+        &self,
+        provider_ref: &Shared<Provider<T>>,
+        run: impl FnOnce(&Provider<T>, Injector) -> Option<crate::provider::AsyncRun<T>>,
+    ) -> Result<Shared<Instance<T>>, Error>
+    where
+        T: ?Sized + Send + Sync + 'static,
+    {
         #[cfg(feature = "metrics")]
         self.inner.metrics.record_factory_execution();
 
@@ -368,8 +397,8 @@ impl Injector {
                 "Async factory permit acquired for set binding"
             );
 
-            if let Some(async_factory) = &provider_ref.async_factory {
-                let instance = Shared::new((async_factory)(self.clone()).await?);
+            if let Some(run) = run(provider_ref, self.clone()) {
+                let instance = Shared::new(run.await?);
                 drop(permit);
                 #[cfg(feature = "tracing")]
                 trace!(
