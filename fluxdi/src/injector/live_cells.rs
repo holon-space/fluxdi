@@ -6,9 +6,13 @@
 //! a run of its own in the wait-for graph: `Live::ready` waits on it, and it
 //! waits on the run it drives or joins. A cycle through a spawned producer
 //! therefore closes in the graph like any other cycle.
+//!
+//! Each generation of a cell has its own producer. A new generation starts
+//! only when the newest one is terminal, and never after `shutdown_live`;
+//! both checks and the producer's record are made under the producers lock.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
 
 use futures::FutureExt;
@@ -19,15 +23,19 @@ use tokio::sync::watch;
 use super::cells::{CURRENT_RUN, CellRegistry, RunRef};
 use super::*;
 use crate::future_local::WithLocal;
-use crate::live::{Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState, LiveTiming};
+use crate::live::{
+    CellState, CellWatch, Generation, Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState,
+    LiveTiming, is_terminal,
+};
 
-type Publish<T> = Shared<watch::Sender<LiveState<T>>>;
+type Publish<T> = Shared<watch::Sender<CellState<T>>>;
+type CachedLookup<T> = Box<dyn Fn(&Injector) -> Option<Shared<Instance<T>>> + Send + Sync>;
 
 /// The live part of a [`CellRegistry`].
 pub(crate) struct LiveCells {
     runtime: OnceLock<Handle>,
     cells: Mutex<HashMap<CellKey, LiveEntry>>,
-    producers: Mutex<Vec<ProducerRecord>>,
+    producers: Mutex<Producers>,
     /// Counts producer starts and ends.
     report: watch::Sender<u64>,
 }
@@ -37,34 +45,35 @@ impl Default for LiveCells {
         Self {
             runtime: OnceLock::new(),
             cells: Mutex::new(HashMap::new()),
-            producers: Mutex::new(Vec::new()),
+            producers: Mutex::new(Producers::default()),
             report: watch::channel(0).0,
         }
     }
 }
 
+#[derive(Default)]
+struct Producers {
+    records: Vec<ProducerRecord>,
+    shut_down: bool,
+}
+
 struct LiveEntry {
-    producer: RunRef,
     /// `Publish<T>` for the key's `T`.
     state: Box<dyn Any + Send + Sync>,
 }
 
 impl LiveEntry {
-    fn handle<T: ?Sized + Send + Sync + 'static>(
-        &self,
-        registry: &Shared<CellRegistry>,
-    ) -> Live<T> {
-        let state = self
-            .state
+    fn publish<T: ?Sized + Send + Sync + 'static>(&self) -> &Publish<T> {
+        self.state
             .downcast_ref::<Publish<T>>()
-            .expect("a live cell key maps to one value type");
-        Live::new(state.subscribe(), self.producer, registry.clone())
+            .expect("a live cell key maps to one value type")
     }
 }
 
 struct ProducerRecord {
     type_name: &'static str,
     member: Option<usize>,
+    generation: Generation,
     started: Instant,
     ended: Option<(LiveOutcome, std::time::Duration)>,
     abort: AbortHandle,
@@ -80,8 +89,111 @@ impl LiveCells {
         Ok(self.runtime.get_or_init(|| current).clone())
     }
 
+    /// The producers, locked for starting one of `type_name`.
+    fn producers_for_start(&self, type_name: &str) -> Result<MutexGuard<'_, Producers>, Error> {
+        let producers = self.producers.lock().expect("live producer mutex poisoned");
+        if producers.shut_down {
+            return Err(Error::live_shut_down(type_name));
+        }
+        Ok(producers)
+    }
+
     fn bump_report(&self) {
         self.report.send_modify(|changes| *changes += 1);
+    }
+}
+
+/// Starts generations of one live cell. Held by the cell's [`Live`] handles,
+/// not by the registry, and it refers to its injectors weakly: a service
+/// cached in the injector may hold a `Live` handle without keeping the
+/// injector alive.
+pub(crate) struct Starter<T: ?Sized + 'static> {
+    resolver: Weak<InjectorInner>,
+    target: Weak<InjectorInner>,
+    key: CellKey,
+    member: Option<usize>,
+    state: Publish<T>,
+    cached: CachedLookup<T>,
+    /// Runs the factory with `(resolver, target)` and stores the instance in
+    /// `target`'s cache.
+    produce: Box<dyn Fn(Injector, Injector) -> RunFuture<T> + Send + Sync>,
+}
+
+impl<T: ?Sized + Send + Sync + 'static> Starter<T> {
+    fn injector(weak: &Weak<InjectorInner>) -> Result<Injector, Error> {
+        let inner = weak
+            .upgrade()
+            .ok_or_else(|| Error::live_injector_dropped(std::any::type_name::<T>()))?;
+        Ok(Injector { inner })
+    }
+
+    pub(crate) fn restart(self: &Shared<Self>) -> Result<Generation, Error> {
+        let type_name = std::any::type_name::<T>();
+        let resolver = Self::injector(&self.resolver)?;
+        let target = Self::injector(&self.target)?;
+        let registry = &resolver.inner.cells;
+        let producers = registry.live.producers_for_start(type_name)?;
+        let newest = self.state.borrow().generation;
+        if !is_terminal(&self.state.borrow().state) {
+            return Err(Error::live_restart_while_running(type_name, newest.get()));
+        }
+        let runtime = registry.live.runtime(type_name)?;
+        let producer = RunRef::next(type_name);
+        let generation = newest.next();
+        self.state.send_modify(|cell| {
+            assert!(
+                is_terminal(&cell.state),
+                "only a restart ends a terminal generation"
+            );
+            *cell = CellState {
+                generation,
+                producer,
+                state: LiveState::Pending,
+            };
+        });
+        registry.spawn_producer(
+            producers,
+            &runtime,
+            self.member,
+            generation,
+            self.state.clone(),
+            self.run(producer, false, resolver.clone(), target),
+        );
+        Ok(generation)
+    }
+
+    /// The producer of one generation. Only the first generation may take
+    /// a value cached meanwhile; a restart always runs the factory.
+    fn run(
+        self: &Shared<Self>,
+        producer: RunRef,
+        first: bool,
+        resolver: Injector,
+        target: Injector,
+    ) -> impl Future<Output = Result<Shared<Instance<T>>, Error>> + Send + 'static {
+        let starter = self.clone();
+        let type_name = std::any::type_name::<T>();
+        let run = async move {
+            let key = starter.key.clone();
+            let cached = || first.then(|| (starter.cached)(&target)).flatten();
+            let produce = || {
+                Box::pin(
+                    AssertUnwindSafe((starter.produce)(resolver.clone(), target.clone()))
+                        .catch_unwind()
+                        .map(|outcome| {
+                            outcome.unwrap_or_else(|panic| {
+                                Err(Error::factory_panicked(type_name, &panic_message(&*panic)))
+                            })
+                        }),
+                ) as RunFuture<T>
+            };
+            resolver.produce_in_cell(key, cached, produce).await
+        };
+        WithLocal::new(
+            &CURRENT_RUN,
+            producer,
+            crate::resolve_guard::resolving_on_new_path(TypeId::of::<T>(), run),
+        )
     }
 }
 
@@ -91,17 +203,22 @@ impl CellRegistry {
     pub(super) fn live_observed<T: ?Sized + Send + Sync + 'static>(
         self: &Shared<Self>,
         key: &CellKey,
-    ) -> Option<Live<T>> {
+    ) -> Option<CellWatch<T>> {
         let cells = self.live.cells.lock().expect("live cell mutex poisoned");
-        cells.get(key).map(|entry| entry.handle(self))
+        cells
+            .get(key)
+            .map(|entry| CellWatch::new(entry.publish::<T>().subscribe(), self.clone()))
     }
 
-    /// Spawns `run` as the producer of `state`. The future of an aborted
-    /// producer is dropped, and its observers see `LiveProducerCancelled`.
+    /// Records `run` as the producer of `generation` of `state` and spawns
+    /// it. The future of an aborted producer is dropped, and its observers
+    /// see `LiveProducerCancelled`.
     fn spawn_producer<T, F>(
         self: &Shared<Self>,
+        mut producers: MutexGuard<'_, Producers>,
         runtime: &Handle,
         member: Option<usize>,
+        generation: Generation,
         state: Publish<T>,
         run: F,
     ) where
@@ -109,15 +226,11 @@ impl CellRegistry {
         F: Future<Output = Result<Shared<Instance<T>>, Error>> + Send + 'static,
     {
         let type_name = std::any::type_name::<T>();
-        let mut producers = self
-            .live
-            .producers
-            .lock()
-            .expect("live producer mutex poisoned");
         let reporter = Reporter {
             registry: self.clone(),
-            record: producers.len(),
+            record: producers.records.len(),
             type_name,
+            generation,
             state,
             reported: false,
         };
@@ -132,13 +245,16 @@ impl CellRegistry {
             };
             reporter.finish(outcome);
         });
-        producers.push(ProducerRecord {
+        producers.records.push(ProducerRecord {
             type_name,
             member,
+            generation,
             started: Instant::now(),
             ended: None,
             abort,
         });
+        // A runtime that is shut down drops the task inside `spawn`, and the
+        // reporter's drop takes this lock.
         drop(producers);
         self.live.bump_report();
         runtime.spawn(task);
@@ -151,6 +267,7 @@ impl CellRegistry {
             .lock()
             .expect("live producer mutex poisoned");
         producers
+            .records
             .iter()
             .map(|record| {
                 let (outcome, elapsed) = match &record.ended {
@@ -160,6 +277,7 @@ impl CellRegistry {
                 LiveTiming {
                     type_name: record.type_name,
                     member: record.member,
+                    generation: record.generation,
                     outcome,
                     elapsed,
                 }
@@ -174,6 +292,7 @@ struct Reporter<T: ?Sized> {
     registry: Shared<CellRegistry>,
     record: usize,
     type_name: &'static str,
+    generation: Generation,
     state: Publish<T>,
     reported: bool,
 }
@@ -185,9 +304,7 @@ impl<T: ?Sized> Reporter<T> {
         let outcome = match &state {
             LiveState::Ready(_) => LiveOutcome::Ready,
             LiveState::Failed(error) => LiveOutcome::Failed(error.clone()),
-            LiveState::Pending | LiveState::Partial(_) => {
-                unreachable!("a producer reports a terminal state")
-            }
+            _ => unreachable!("a producer reports a terminal state"),
         };
         {
             let mut producers = self
@@ -196,10 +313,16 @@ impl<T: ?Sized> Reporter<T> {
                 .producers
                 .lock()
                 .expect("live producer mutex poisoned");
-            let record = &mut producers[self.record];
+            let record = &mut producers.records[self.record];
             record.ended = Some((outcome, record.started.elapsed()));
         }
-        self.state.send_replace(state);
+        self.state.send_modify(|cell| {
+            assert_eq!(
+                cell.generation, self.generation,
+                "a generation stays newest until its producer reports"
+            );
+            cell.state = state;
+        });
         self.registry.live.bump_report();
     }
 }
@@ -247,7 +370,9 @@ impl Injector {
     }
 
     /// Returns a handle to `T` at once and starts its producer on the first
-    /// call; later live and hard resolves share that producer.
+    /// call; later live and hard resolves share that producer. A runtime is
+    /// needed only to start the producer, not for a value already cached or
+    /// a cell already live.
     pub fn try_resolve_live<T>(&self) -> Result<Live<T>, Error>
     where
         T: ?Sized + Send + Sync + 'static,
@@ -255,14 +380,12 @@ impl Injector {
         let provider = self.resolve_provider::<T>()?;
         let target = self.live_cache_target::<T>(provider.scope)?;
         let key = CellKey::new(&target, BindingKey::Single(TypeId::of::<T>()));
-        let cache = target.clone();
-        let resolver = self.clone();
         self.live_cell(
             key,
             None,
-            move || cache.get_instance::<T>(),
-            move || {
-                let (injector, target) = (resolver.clone(), target.clone());
+            &target,
+            |target: &Injector| target.get_instance::<T>(),
+            |injector: Injector, target: Injector| {
                 Box::pin(async move {
                     let instance = injector.resolve_instance_async::<T>().await?;
                     target.store_instance::<T>(instance.clone());
@@ -300,15 +423,14 @@ impl Injector {
                     &target,
                     BindingKey::SetMember(SetProviderKey::of::<T>(&provider)),
                 );
-                let (cache, cached_provider) = (target.clone(), provider.clone());
-                let resolver = self.clone();
+                let cached_provider = provider.clone();
                 self.live_cell(
                     key,
                     Some(member),
-                    move || cache.get_set_instance::<T>(&cached_provider),
-                    move || {
-                        let (injector, provider, target) =
-                            (resolver.clone(), provider.clone(), target.clone());
+                    &target,
+                    move |target: &Injector| target.get_set_instance::<T>(&cached_provider),
+                    move |injector: Injector, target: Injector| {
+                        let provider = provider.clone();
                         Box::pin(async move {
                             let instance = injector
                                 .resolve_instance_from_provider_async::<T>(&provider)
@@ -331,22 +453,30 @@ impl Injector {
             .unwrap_or_else(|error| panic!("{}", error))
     }
 
-    /// Cancels every live producer of this injector tree that has not
-    /// finished. Their observers see `LiveProducerCancelled`.
+    /// Ends live production in this injector tree for good: every running
+    /// producer is cancelled, and its observers see `LiveProducerCancelled`.
+    /// Afterwards no producer starts: a restart, or a live resolve that would
+    /// need one, fails with `LiveProducerCancelled`.
     pub fn shutdown_live(&self) {
-        let producers = self
+        let mut producers = self
             .inner
             .cells
             .live
             .producers
             .lock()
             .expect("live producer mutex poisoned");
-        for record in producers.iter().filter(|record| record.ended.is_none()) {
+        producers.shut_down = true;
+        for record in producers
+            .records
+            .iter()
+            .filter(|record| record.ended.is_none())
+        {
             record.abort.abort();
         }
     }
 
-    /// Outcome and timing of every live producer started so far.
+    /// Outcome and timing of every live producer started so far, one row per
+    /// generation.
     pub fn live_report(&self) -> Vec<LiveTiming> {
         self.inner.cells.live_report()
     }
@@ -359,63 +489,79 @@ impl Injector {
         )
     }
 
-    /// The live cell of `key`, created and started on the first call.
+    /// The live cell of `key`, created on the first call; its first
+    /// generation starts unless `cached` finds the value in `target`.
     fn live_cell<T>(
         &self,
         key: CellKey,
         member: Option<usize>,
-        cached: impl Fn() -> Option<Shared<Instance<T>>> + Send + Sync + 'static,
-        produce: impl Fn() -> RunFuture<T> + Send + Sync + 'static,
+        target: &Injector,
+        cached: impl Fn(&Injector) -> Option<Shared<Instance<T>>> + Send + Sync + 'static,
+        produce: impl Fn(Injector, Injector) -> RunFuture<T> + Send + Sync + 'static,
     ) -> Result<Live<T>, Error>
     where
         T: ?Sized + Send + Sync + 'static,
     {
         let type_name = std::any::type_name::<T>();
         let registry = &self.inner.cells;
-        let runtime = registry.live.runtime(type_name)?;
         let mut cells = registry
             .live
             .cells
             .lock()
             .expect("live cell mutex poisoned");
-        if let Some(entry) = cells.get(&key) {
-            return Ok(entry.handle(registry));
-        }
-
-        let producer = RunRef::next(type_name);
-        let initial = match cached() {
-            Some(instance) => LiveState::Ready(instance.value()),
-            None => LiveState::Pending,
+        let (state, start) = match cells.get(&key) {
+            Some(entry) => (entry.publish::<T>().clone(), None),
+            None => {
+                let producer = RunRef::next(type_name);
+                let (initial, start) = match cached(target) {
+                    Some(instance) => (LiveState::Ready(instance.value()), None),
+                    None => {
+                        let runtime = registry.live.runtime(type_name)?;
+                        let producers = registry.live.producers_for_start(type_name)?;
+                        (LiveState::Pending, Some((runtime, producers, producer)))
+                    }
+                };
+                let state: Publish<T> = Shared::new(
+                    watch::channel(CellState {
+                        generation: Generation::FIRST,
+                        producer,
+                        state: initial,
+                    })
+                    .0,
+                );
+                cells.insert(
+                    key.clone(),
+                    LiveEntry {
+                        state: Box::new(state.clone()),
+                    },
+                );
+                (state, start)
+            }
         };
-        let start = matches!(initial, LiveState::Pending);
-        let state: Publish<T> = Shared::new(watch::channel(initial).0);
-        let entry = LiveEntry {
-            producer,
-            state: Box::new(state.clone()),
-        };
-        let live = entry.handle(registry);
-        cells.insert(key.clone(), entry);
         drop(cells);
 
-        if start {
-            let resolver = self.clone();
-            let run = async move {
-                resolver
-                    .produce_in_cell(key, cached, move || {
-                        Box::pin(AssertUnwindSafe(produce()).catch_unwind().map(|outcome| {
-                            outcome.unwrap_or_else(|panic| {
-                                Err(Error::factory_panicked(type_name, &panic_message(&*panic)))
-                            })
-                        })) as RunFuture<T>
-                    })
-                    .await
-            };
-            let run = WithLocal::new(
-                &CURRENT_RUN,
-                producer,
-                crate::resolve_guard::resolving_on_new_path(TypeId::of::<T>(), run),
+        let starter = Shared::new(Starter {
+            resolver: Shared::downgrade(&self.inner),
+            target: Shared::downgrade(&target.inner),
+            key,
+            member,
+            state: state.clone(),
+            cached: Box::new(cached),
+            produce: Box::new(produce),
+        });
+        let live = Live::new(
+            CellWatch::new(state.subscribe(), registry.clone()),
+            starter.clone(),
+        );
+        if let Some((runtime, producers, producer)) = start {
+            registry.spawn_producer(
+                producers,
+                &runtime,
+                member,
+                Generation::FIRST,
+                state,
+                starter.run(producer, true, self.clone(), target.clone()),
             );
-            registry.spawn_producer(&runtime, member, state, run);
         }
         Ok(live)
     }
@@ -423,5 +569,60 @@ impl Injector {
     fn live_cache_target<T: ?Sized>(&self, scope: Scope) -> Result<Injector, Error> {
         self.cache_target_for_scope(scope)
             .ok_or_else(|| Error::live_requires_cached_scope(std::any::type_name::<T>()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::Provider;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cached_service_holding_a_live_handle_does_not_keep_its_injector_alive() {
+        struct Db;
+        struct Holder(Live<Db>);
+        let injector = Injector::root();
+        injector.provide::<Db>(Provider::root_async(|_| async { Shared::new(Db) }));
+        injector.provide::<Holder>(Provider::root(|injector: &Injector| {
+            Shared::new(Holder(injector.resolve_live::<Db>()))
+        }));
+        let holder = injector.try_resolve::<Holder>().unwrap();
+        holder.0.ready().await.unwrap();
+        drop(holder);
+
+        let inner = Shared::downgrade(&injector.inner);
+        drop(injector);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while inner.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a live handle in the cache keeps its injector alive");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_after_the_injector_is_dropped_is_an_error() {
+        struct Db;
+        let injector = Injector::root();
+        injector.provide::<Db>(Provider::root_async(|_| async { Shared::new(Db) }));
+        let live = injector.resolve_live::<Db>();
+        live.ready().await.unwrap();
+
+        let inner = Shared::downgrade(&injector.inner);
+        drop(injector);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while inner.strong_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the finished producer keeps its injector alive");
+
+        let error = live.restart().err().expect("restarted without an injector");
+        assert_eq!(error.kind, crate::ErrorKind::LiveInjectorDropped);
+        assert_eq!(live.state().generation, Generation::FIRST);
     }
 }

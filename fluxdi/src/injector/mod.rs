@@ -299,7 +299,7 @@ mod graph_validation;
 #[cfg(all(test, feature = "async-factory"))]
 mod in_flight_cell_tests;
 #[cfg(feature = "live")]
-mod live_cells;
+pub(crate) mod live_cells;
 
 #[cfg(not(feature = "thread-safe"))]
 mod nts_instance_factory;

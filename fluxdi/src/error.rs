@@ -35,8 +35,37 @@ use tracing::error;
 /// Error categories for the container.
 ///
 /// These variants are intentionally coarse-grained to keep error handling
-/// straightforward while still expressive enough for diagnostics.
+/// straightforward while still expressive enough for diagnostics. More kinds
+/// may be added, so a match needs a wildcard arm:
+///
+/// ```compile_fail,E0004
+/// use fluxdi::ErrorKind;
+///
+/// fn retry(kind: &ErrorKind) -> bool {
+///     match kind {
+///         ErrorKind::ServiceNotProvided => false,
+///         ErrorKind::TypeMismatch => false,
+///         ErrorKind::ProviderAlreadyRegistered => false,
+///         ErrorKind::CircularDependency => false,
+///         ErrorKind::AsyncFactoryRequiresAsyncResolve => false,
+///         ErrorKind::ResourceLimitExceeded => true,
+///         ErrorKind::ModuleLifecycleFailed => false,
+///         ErrorKind::GraphValidationFailed => false,
+///         ErrorKind::DynamicProviderNotFound => false,
+///         ErrorKind::EagerResolutionFailed => false,
+///         ErrorKind::FactoryFailed => true,
+///         ErrorKind::LiveProducerFailed => true,
+///         ErrorKind::LiveProducerCancelled => false,
+///         ErrorKind::LiveRuntimeMissing => false,
+///         ErrorKind::LiveRequiresCachedScope => false,
+///         ErrorKind::LiveRestartWhileRunning => true,
+///         ErrorKind::LiveInjectorDropped => false,
+///         ErrorKind::LiveSlotOutOfRange => false,
+///     }
+/// }
+/// ```
 #[derive(Clone, PartialEq, Debug)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// Service provider not found for the requested type.
     ServiceNotProvided,
@@ -69,6 +98,13 @@ pub enum ErrorKind {
     LiveRuntimeMissing,
     /// A transient provider was resolved live; a live cell needs a cached value.
     LiveRequiresCachedScope,
+    /// A live dependency was restarted while its current generation still runs.
+    LiveRestartWhileRunning,
+    /// A live dependency was restarted after every clone of its injector
+    /// was dropped.
+    LiveInjectorDropped,
+    /// A live set was asked for a slot it does not have.
+    LiveSlotOutOfRange,
 }
 
 /// Container error structure.
@@ -295,6 +331,50 @@ impl Error {
             format!(
                 "Live producer for {} was cancelled before it finished",
                 type_name
+            ),
+        )
+    }
+
+    /// `shutdown_live` was called, so no producer of `type_name` starts.
+    pub fn live_shut_down(type_name: &str) -> Self {
+        Self::new(
+            ErrorKind::LiveProducerCancelled,
+            format!(
+                "Live producer for {} cannot start: shutdown_live ended live production",
+                type_name
+            ),
+        )
+    }
+
+    /// `type_name` was restarted while its generation `generation` runs.
+    pub fn live_restart_while_running(type_name: &str, generation: u64) -> Self {
+        Self::new(
+            ErrorKind::LiveRestartWhileRunning,
+            format!(
+                "Cannot restart {}: its generation {} is still running",
+                type_name, generation
+            ),
+        )
+    }
+
+    /// `type_name` was restarted after its injector was dropped.
+    pub fn live_injector_dropped(type_name: &str) -> Self {
+        Self::new(
+            ErrorKind::LiveInjectorDropped,
+            format!(
+                "Cannot restart {}: every clone of its injector was dropped",
+                type_name
+            ),
+        )
+    }
+
+    /// Slot `slot` of a live set of `type_name` with `len` members.
+    pub fn live_slot_out_of_range(type_name: &str, slot: usize, len: usize) -> Self {
+        Self::new(
+            ErrorKind::LiveSlotOutOfRange,
+            format!(
+                "Live set of {} has no slot {}: it has {} members",
+                type_name, slot, len
             ),
         )
     }

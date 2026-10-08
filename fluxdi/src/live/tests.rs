@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
+use crate::live::Generational;
 use crate::{Error, ErrorKind, Injector, LiveOutcome, LiveState, Provider, Shared};
 
 const HANG: Duration = Duration::from_secs(5);
@@ -66,12 +67,12 @@ async fn resolve_live_returns_pending_before_the_producer_finishes() {
     injector.provide::<Db>(gated_db(gate.clone(), Arc::new(AtomicUsize::new(0))));
 
     let live = injector.resolve_live::<Db>();
-    assert!(matches!(live.state(), LiveState::Pending));
+    assert!(matches!(live.state().value, LiveState::Pending));
 
     gate.notify_one();
     let db = timeout(HANG, live.ready()).await.unwrap().unwrap();
-    assert_eq!(db.0, "ready");
-    assert!(matches!(live.state(), LiveState::Ready(_)));
+    assert_eq!(db.value.0, "ready");
+    assert!(matches!(live.state().value, LiveState::Ready(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -101,8 +102,8 @@ async fn producer_starts_on_first_resolve_and_runs_once() {
     let from_first = timeout(HANG, first.ready()).await.unwrap().unwrap();
     let from_second = second.ready().await.unwrap();
     let from_hard = timeout(HANG, hard).await.unwrap().unwrap().unwrap();
-    assert!(Shared::ptr_eq(&from_first, &from_second));
-    assert!(Shared::ptr_eq(&from_first, &from_hard));
+    assert!(Shared::ptr_eq(&from_first.value, &from_second.value));
+    assert!(Shared::ptr_eq(&from_first.value, &from_hard));
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
 
@@ -122,7 +123,7 @@ async fn live_set_grows_as_members_become_ready() {
     for index in [2, 0, 1] {
         gates[index].notify_one();
         timeout(HANG, set.changed()).await.unwrap();
-        let names: Vec<&str> = set.ready_members().iter().map(|s| s.name()).collect();
+        let names: Vec<&str> = set.ready_members().iter().map(|s| s.value.name()).collect();
         seen.push(names);
     }
     assert_eq!(
@@ -141,7 +142,7 @@ async fn a_failed_producer_reaches_every_observer() {
     injector.provide::<Db>(Provider::root_async(|_| explode()));
     injector.provide::<String>(Provider::root_async(|inj: Injector| async move {
         let db = inj.resolve_live::<Db>().ready().await.unwrap();
-        Shared::new(db.0.to_string())
+        Shared::new(db.value.0.to_string())
     }));
     injector.provide_into_set::<dyn Source>(Provider::root_async(|inj: Injector| async move {
         inj.resolve_live::<Db>().ready().await.unwrap();
@@ -159,7 +160,7 @@ async fn a_failed_producer_reaches_every_observer() {
         "{}",
         error.message
     );
-    assert!(matches!(db.state(), LiveState::Failed(_)));
+    assert!(matches!(db.state().value, LiveState::Failed(_)));
 
     let hard = timeout(HANG, injector.try_resolve_async::<Db>())
         .await
@@ -181,7 +182,7 @@ async fn a_failed_producer_reaches_every_observer() {
         "{}",
         error.message
     );
-    let fine: Vec<&str> = set.ready_members().iter().map(|s| s.name()).collect();
+    let fine: Vec<&str> = set.ready_members().iter().map(|s| s.value.name()).collect();
     assert_eq!(fine, vec!["fine"]);
 
     let hard_set = timeout(HANG, injector.try_resolve_all_async::<dyn Source>())
@@ -361,7 +362,7 @@ fn resolve_live_from_a_thread_without_a_runtime_uses_the_held_handle() {
     let ui_thread = std::thread::spawn(move || {
         let live = injector.resolve_live::<Db>();
         futures::executor::block_on(live.ready()).unwrap();
-        live.state()
+        live.state().value
     });
     let state = ui_thread.join().unwrap();
     assert!(
@@ -382,6 +383,18 @@ fn resolve_live_without_any_runtime_is_an_error() {
     assert_eq!(error.kind, ErrorKind::LiveRuntimeMissing);
 }
 
+#[test]
+fn a_cached_value_resolves_live_without_any_runtime() {
+    let injector = Injector::root();
+    injector.provide::<Db>(Provider::root(|_| Shared::new(Db("cached"))));
+    let hard = injector.try_resolve::<Db>().unwrap();
+
+    let live = injector
+        .try_resolve_live::<Db>()
+        .expect("a cached value needs no producer, so no runtime");
+    assert!(matches!(live.state().value, LiveState::Ready(db) if Shared::ptr_eq(&db, &hard)));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cached_value_gives_a_ready_cell_without_a_producer() {
     let injector = Injector::root();
@@ -391,7 +404,7 @@ async fn a_cached_value_gives_a_ready_cell_without_a_producer() {
     let hard = injector.try_resolve_async::<Db>().await.unwrap();
 
     let live = injector.resolve_live::<Db>();
-    assert!(matches!(live.state(), LiveState::Ready(db) if Shared::ptr_eq(&db, &hard)));
+    assert!(matches!(live.state().value, LiveState::Ready(db) if Shared::ptr_eq(&db, &hard)));
     assert!(injector.live_report().is_empty());
 }
 
@@ -406,4 +419,285 @@ fn a_transient_provider_cannot_be_resolved_live() {
     }));
     let error = injector.try_resolve_live::<Db>().err().unwrap();
     assert_eq!(error.kind, ErrorKind::LiveRequiresCachedScope);
+}
+
+/// Fails on run 1; run 2 waits for `gate`, then succeeds.
+fn flaky_db(gate: Arc<Notify>, runs: Arc<AtomicUsize>) -> Provider<Db> {
+    Provider::root_try_async(move |_| {
+        let gate = gate.clone();
+        let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+        async move {
+            if run == 1 {
+                return Err(std::io::Error::other("connection refused"));
+            }
+            gate.notified().await;
+            Ok::<_, std::io::Error>(Shared::new(Db("reconnected")))
+        }
+    })
+}
+
+fn label<T: ?Sized>(state: &Generational<LiveState<T>>) -> (u64, &'static str) {
+    let name = match &state.value {
+        LiveState::Pending => "pending",
+        LiveState::Partial(_) => "partial",
+        LiveState::Ready(_) => "ready",
+        LiveState::Failed(_) => "failed",
+        _ => unreachable!("no other live state exists"),
+    };
+    (state.generation.get(), name)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_after_a_failure_publishes_the_next_generation() {
+    let gate = Arc::new(Notify::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide::<Db>(flaky_db(gate.clone(), runs.clone()));
+
+    let live = injector.resolve_live::<Db>();
+    let mut observer = live.clone();
+    let mut seen = vec![label(&live.state())];
+    seen.push(label(&timeout(HANG, observer.changed()).await.unwrap()));
+    let failed = live.state().generation;
+    assert!(live.is_current(failed));
+
+    let restarted = live.restart().unwrap();
+    assert_eq!(restarted, failed.next());
+    seen.push(label(&timeout(HANG, observer.changed()).await.unwrap()));
+    let hard = tokio::spawn({
+        let injector = injector.clone();
+        async move { injector.try_resolve_async::<Db>().await }
+    });
+    gate.notify_one();
+    seen.push(label(&timeout(HANG, observer.changed()).await.unwrap()));
+
+    assert_eq!(
+        seen,
+        vec![(1, "pending"), (1, "failed"), (2, "pending"), (2, "ready")]
+    );
+    let ready = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    assert_eq!(ready.generation, restarted);
+    assert_eq!(ready.value.0, "reconnected");
+    assert!(!live.is_current(failed));
+    assert!(live.is_current(restarted));
+    let hard = timeout(HANG, hard).await.unwrap().unwrap().unwrap();
+    assert!(Shared::ptr_eq(&hard, &ready.value));
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+    let report: Vec<(u64, bool)> = injector
+        .live_report()
+        .iter()
+        .map(|row| {
+            (
+                row.generation.get(),
+                matches!(row.outcome, LiveOutcome::Ready),
+            )
+        })
+        .collect();
+    assert_eq!(report, vec![(1, false), (2, true)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_while_the_generation_runs_is_refused() {
+    let gate = Arc::new(Notify::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide::<Db>(gated_db(gate.clone(), runs.clone()));
+
+    let live = injector.resolve_live::<Db>();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let error = live.restart().expect_err("restarted a running generation");
+    assert_eq!(error.kind, ErrorKind::LiveRestartWhileRunning);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "two producers ran for one cell"
+    );
+    assert_eq!(injector.live_report().len(), 1);
+
+    gate.notify_one();
+    let first = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    assert_eq!(first.generation.get(), 1);
+
+    let second = live.restart().expect("a ready generation is terminal");
+    gate.notify_one();
+    let ready = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    assert_eq!(ready.generation, second);
+    assert!(!Shared::ptr_eq(&first.value, &ready.value));
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cache_holds_the_last_ready_generation() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide::<Db>(Provider::root_try_async({
+        let runs = runs.clone();
+        move |_| {
+            let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                match run {
+                    1 => Ok(Shared::new(Db("first"))),
+                    2 => Err(std::io::Error::other("connection lost")),
+                    _ => Ok(Shared::new(Db("third"))),
+                }
+            }
+        }
+    }));
+
+    let live = injector.resolve_live::<Db>();
+    let first = timeout(HANG, live.ready()).await.unwrap().unwrap();
+
+    live.restart().unwrap();
+    let error = timeout(HANG, live.ready()).await.unwrap().unwrap_err();
+    assert!(
+        error.message.contains("connection lost"),
+        "{}",
+        error.message
+    );
+    let cached = injector.try_resolve::<Db>().unwrap();
+    assert!(Shared::ptr_eq(&cached, &first.value));
+
+    live.restart().unwrap();
+    let third = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    assert_eq!(third.generation.get(), 3);
+    let cached = injector.try_resolve::<Db>().unwrap();
+    assert!(Shared::ptr_eq(&cached, &third.value));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_slot_restarts_in_place() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(Provider::root(|_| {
+        Shared::new(NamedSource("org")) as Shared<dyn Source>
+    }));
+    injector.provide_into_set::<dyn Source>(Provider::root_try_async({
+        let runs = runs.clone();
+        move |_| {
+            let run = runs.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if run == 1 {
+                    return Err(std::io::Error::other("mcp unreachable"));
+                }
+                Ok::<_, std::io::Error>(Shared::new(NamedSource("mcp")) as Shared<dyn Source>)
+            }
+        }
+    }));
+
+    let set = injector.resolve_all_live::<dyn Source>();
+    timeout(HANG, set.complete()).await.unwrap().unwrap_err();
+    assert_eq!(
+        set.members().iter().map(label).collect::<Vec<_>>(),
+        vec![(1, "ready"), (1, "failed")]
+    );
+
+    assert_eq!(set.restart(1).unwrap().get(), 2);
+    let members = timeout(HANG, set.complete()).await.unwrap().unwrap();
+    let names: Vec<(u64, &str)> = members
+        .iter()
+        .map(|member| (member.generation.get(), member.value.name()))
+        .collect();
+    assert_eq!(names, vec![(1, "org"), (2, "mcp")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_live_ends_live_production_for_good() {
+    let injector = Injector::root();
+    injector.provide::<Db>(Provider::root_async(|_| async {
+        std::future::pending::<()>().await;
+        Shared::new(Db("never"))
+    }));
+    injector.provide::<String>(Provider::root_async(|_| async {
+        Shared::new("never started".to_string())
+    }));
+    injector.provide::<u32>(Provider::root(|_| Shared::new(7)));
+    injector.try_resolve::<u32>().unwrap();
+
+    let live = injector.resolve_live::<Db>();
+    injector.shutdown_live();
+    let error = timeout(HANG, live.ready()).await.unwrap().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+
+    let error = live.restart().expect_err("restarted after shutdown_live");
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+    assert_eq!(label(&live.state()), (1, "failed"));
+    let error = injector
+        .try_resolve_live::<String>()
+        .err()
+        .expect("started a producer after shutdown_live");
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled);
+    assert_eq!(injector.live_report().len(), 1);
+    let cached = injector.try_resolve_live::<u32>().unwrap();
+    assert_eq!(label(&cached.state()), (1, "ready"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiter_that_missed_a_generation_waits_for_the_next() {
+    let gate = Arc::new(Notify::new());
+    let injector = Injector::root();
+    injector.provide::<Db>(flaky_db(gate.clone(), Arc::new(AtomicUsize::new(0))));
+
+    let live = injector.resolve_live::<Db>();
+    let mut waiter = Box::pin(live.ready());
+    assert!(futures::poll!(&mut waiter).is_pending());
+
+    let mut observer = live.clone();
+    assert_eq!(
+        label(&timeout(HANG, observer.changed()).await.unwrap()),
+        (1, "failed")
+    );
+    live.restart().unwrap();
+    gate.notify_one();
+
+    let ready = timeout(HANG, waiter).await.unwrap().unwrap();
+    assert_eq!(ready.generation.get(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hard_resolve_during_a_restart_returns_the_last_ready_generation() {
+    let gate = Arc::new(Notify::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let injector = Injector::root();
+    injector.provide::<Db>(gated_db(gate.clone(), runs.clone()));
+
+    let live = injector.resolve_live::<Db>();
+    gate.notify_one();
+    let first = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    live.restart().unwrap();
+
+    let hard = timeout(HANG, injector.try_resolve_async::<Db>())
+        .await
+        .expect("a hard resolve waited for the restarted generation")
+        .unwrap();
+    assert!(Shared::ptr_eq(&hard, &first.value));
+    assert!(Shared::ptr_eq(
+        &injector.try_resolve::<Db>().unwrap(),
+        &first.value
+    ));
+    assert_eq!(label(&live.state()), (2, "pending"));
+
+    gate.notify_one();
+    let second = timeout(HANG, live.ready()).await.unwrap().unwrap();
+    let hard = injector.try_resolve_async::<Db>().await.unwrap();
+    assert!(Shared::ptr_eq(&hard, &second.value));
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_restart_of_a_missing_slot_is_an_error() {
+    let injector = Injector::root();
+    injector.provide_into_set::<dyn Source>(Provider::root(|_| {
+        Shared::new(NamedSource("org")) as Shared<dyn Source>
+    }));
+    let set = injector.resolve_all_live::<dyn Source>();
+
+    let error = set.restart(7).expect_err("restarted a slot the set lacks");
+    assert_eq!(error.kind, ErrorKind::LiveSlotOutOfRange);
+    assert!(
+        error.message.contains("slot 7") && error.message.contains("1 members"),
+        "{}",
+        error.message
+    );
 }

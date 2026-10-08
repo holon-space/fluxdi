@@ -32,7 +32,9 @@ pub use graph::*;
 pub use injector::*;
 pub use instance::*;
 #[cfg(feature = "live")]
-pub use live::{Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState, LiveTiming};
+pub use live::{
+    Generation, Generational, Live, LiveOutcome, LiveReportChanges, LiveSet, LiveState, LiveTiming,
+};
 pub use module::*;
 pub use observability::*;
 pub use provider::*;

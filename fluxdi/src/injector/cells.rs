@@ -379,7 +379,7 @@ impl Injector {
                 return live
                     .ready()
                     .await
-                    .map(|value| Shared::new(Instance::new(value)));
+                    .map(|ready| Shared::new(Instance::new(ready.value)));
             }
             match registry.cell(key.clone(), &cached) {
                 Cell::Cached(instance) => return Ok(instance),
