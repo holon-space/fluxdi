@@ -15,8 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rollback policy: on bootstrap failure, `on_stop` is called on already-started modules (sequential and parallel)
 - Graceful shutdown timeout: with `ShutdownOptions::with_timeout`, all modules' `on_stop` are attempted within the time budget; no partial abort
 
+- `Error::module_lifecycle_failed_with_source()`: a lifecycle error whose `source()` is the hook's error
+- `try_optional_resolve`, `try_optional_resolve_named`, `try_optional_resolve_all` and their `_async` forms: `Ok(None)` only when no provider is registered; every other failure is returned
+
 ### Changed
 
+- Bootstrap and shutdown keep a module's `configure`/`on_start`/`on_stop` error as the lifecycle error's `source()`; the message is unchanged. `bootstrap_aggregate`/`shutdown_aggregate` keep the first failure as `source()`
+- A failed `on_stop` during bootstrap rollback is reported in the bootstrap error after the start failure, instead of being discarded
+- `optional_resolve*` is deprecated: it turns every failure, including a failed factory, into `None`; use `try_optional_resolve*`
 - **Performance**: Cache-hit resolve skips `ResolveGuard` (no recursion); ~67% faster cached resolve (~20 ns → ~12 ns default)
 
 ## [1.2.2] - 2026-03-21

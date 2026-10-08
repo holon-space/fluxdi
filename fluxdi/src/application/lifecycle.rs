@@ -135,10 +135,10 @@ impl Application {
         while let Some(loaded) = self.started_modules.pop() {
             let module_name = std::any::type_name_of_val(&*loaded.module);
             if let Err(err) = loaded.module.on_stop(loaded.injector.clone()).await {
-                shutdown_errors.push(Error::module_lifecycle_failed(
+                shutdown_errors.push(Error::module_lifecycle_failed_with_source(
                     module_name,
                     "on_stop",
-                    &err.to_string(),
+                    err,
                 ));
             }
         }
@@ -204,10 +204,10 @@ impl Application {
             {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    shutdown_errors.push(Error::module_lifecycle_failed(
+                    shutdown_errors.push(Error::module_lifecycle_failed_with_source(
                         module_name,
                         "on_stop",
-                        &err.to_string(),
+                        err,
                     ));
                 }
                 Err(_) => {

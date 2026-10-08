@@ -359,6 +359,10 @@ impl Injector {
     }
 
     #[cfg(feature = "async-factory")]
+    /// Resolves `T`, or returns `None` when the resolve fails for any
+    /// reason, including a failed factory. [`try_optional_resolve_async`](Self::try_optional_resolve_async)
+    /// returns `None` only when no provider of `T` is registered.
+    #[deprecated(note = "swallows factory failures; use try_optional_resolve*")]
     pub async fn optional_resolve_async<T>(&self) -> Option<Shared<T>>
     where
         T: ?Sized + 'static,
@@ -367,6 +371,23 @@ impl Injector {
     }
 
     #[cfg(feature = "async-factory")]
+    /// Resolves `T`; `Ok(None)` only when no provider of `T` is registered.
+    /// Every other failure, such as a failed factory, is returned.
+    pub async fn try_optional_resolve_async<T>(&self) -> Result<Option<Shared<T>>, Error>
+    where
+        T: ?Sized + 'static,
+    {
+        if self.get_provider::<T>().is_none() {
+            return Ok(None);
+        }
+        self.try_resolve_async::<T>().await.map(Some)
+    }
+
+    #[cfg(feature = "async-factory")]
+    /// Resolves every member of the `T` set, or returns `None` when the resolve fails for any
+    /// reason, including a failed factory. [`try_optional_resolve_all_async`](Self::try_optional_resolve_all_async)
+    /// returns `None` only when no set provider of `T` is registered.
+    #[deprecated(note = "swallows factory failures; use try_optional_resolve*")]
     pub async fn optional_resolve_all_async<T>(&self) -> Option<Vec<Shared<T>>>
     where
         T: ?Sized + 'static,
@@ -375,10 +396,45 @@ impl Injector {
     }
 
     #[cfg(feature = "async-factory")]
+    /// Resolves every member of the `T` set; `Ok(None)` only when no set provider of `T` is registered.
+    /// Every other failure, such as a failed factory, is returned.
+    pub async fn try_optional_resolve_all_async<T>(&self) -> Result<Option<Vec<Shared<T>>>, Error>
+    where
+        T: ?Sized + 'static,
+    {
+        let mut providers = Vec::new();
+        self.collect_set_providers::<T>(&mut providers)?;
+        if providers.is_empty() {
+            return Ok(None);
+        }
+        self.try_resolve_all_async::<T>().await.map(Some)
+    }
+
+    #[cfg(feature = "async-factory")]
+    /// Resolves `T` named `name`, or returns `None` when the resolve fails for any
+    /// reason, including a failed factory. [`try_optional_resolve_named_async`](Self::try_optional_resolve_named_async)
+    /// returns `None` only when no provider of `T` is registered under `name`.
+    #[deprecated(note = "swallows factory failures; use try_optional_resolve*")]
     pub async fn optional_resolve_named_async<T>(&self, name: &str) -> Option<Shared<T>>
     where
         T: ?Sized + 'static,
     {
         self.try_resolve_named_async::<T>(name).await.ok()
+    }
+
+    #[cfg(feature = "async-factory")]
+    /// Resolves `T` named `name`; `Ok(None)` only when no provider of `T` is registered under `name`.
+    /// Every other failure, such as a failed factory, is returned.
+    pub async fn try_optional_resolve_named_async<T>(
+        &self,
+        name: &str,
+    ) -> Result<Option<Shared<T>>, Error>
+    where
+        T: ?Sized + 'static,
+    {
+        if self.get_provider_named::<T>(name).is_none() {
+            return Ok(None);
+        }
+        self.try_resolve_named_async::<T>(name).await.map(Some)
     }
 }

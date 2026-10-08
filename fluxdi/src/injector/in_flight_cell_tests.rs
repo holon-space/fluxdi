@@ -464,6 +464,7 @@ impl Named for Svc {
     }
 }
 
+#[allow(deprecated)]
 async fn resolve_through_a_borrowed_injector(injector: &Injector) -> usize {
     match injector.optional_resolve_async::<dyn Named>().await {
         Some(named) => named.name(),

@@ -40,7 +40,7 @@ impl Application {
 
         let module_name = std::any::type_name_of_val(&*module);
         module.configure(&module_injector).map_err(|err| {
-            Error::module_lifecycle_failed(module_name, "configure", &err.to_string())
+            Error::module_lifecycle_failed_with_source(module_name, "configure", err)
         })?;
 
         #[cfg(feature = "tracing")]
@@ -105,20 +105,17 @@ impl Application {
                 } => {
                     let module_name = std::any::type_name_of_val(&*module);
                     module.configure(&module_injector).map_err(|err| {
-                        Error::module_lifecycle_failed(module_name, "configure", &err.to_string())
+                        Error::module_lifecycle_failed_with_source(module_name, "configure", err)
                     })?;
 
                     if let Err(err) = module.on_start(module_injector.clone()).await {
-                        Self::end_live_production(&root);
-                        // Rollback: call on_stop on already-started modules (reverse order)
-                        while let Some(loaded_mod) = loaded.pop() {
-                            let _ = loaded_mod.module.on_stop(loaded_mod.injector.clone()).await;
-                        }
-                        return Err(Error::module_lifecycle_failed(
+                        let mut errors = vec![Error::module_lifecycle_failed_with_source(
                             module_name,
                             "on_start",
-                            &err.to_string(),
-                        ));
+                            err,
+                        )];
+                        Self::roll_back(&root, loaded, &mut errors).await;
+                        return Err(Error::bootstrap_aggregate(errors));
                     }
 
                     loaded.push(LoadedModule {
@@ -176,7 +173,7 @@ impl Application {
                 } => {
                     let module_name = std::any::type_name_of_val(&*module);
                     module.configure(&module_injector).map_err(|err| {
-                        Error::module_lifecycle_failed(module_name, "configure", &err.to_string())
+                        Error::module_lifecycle_failed_with_source(module_name, "configure", err)
                     })?;
 
                     pending.push((module, module_injector));
@@ -206,10 +203,10 @@ impl Application {
                     loaded.push(LoadedModule { module, injector });
                 }
                 Err(err) => {
-                    bootstrap_errors.push(Error::module_lifecycle_failed(
+                    bootstrap_errors.push(Error::module_lifecycle_failed_with_source(
                         module_name,
                         "on_start",
-                        &err.to_string(),
+                        err,
                     ));
                 }
             }
@@ -218,12 +215,24 @@ impl Application {
         if bootstrap_errors.is_empty() {
             Ok(loaded)
         } else {
-            Self::end_live_production(&root);
-            // Rollback: call on_stop on successfully-started modules (reverse order)
-            while let Some(loaded_mod) = loaded.pop() {
-                let _ = loaded_mod.module.on_stop(loaded_mod.injector.clone()).await;
-            }
+            Self::roll_back(&root, loaded, &mut bootstrap_errors).await;
             Err(Error::bootstrap_aggregate(bootstrap_errors))
+        }
+    }
+
+    /// Calls `on_stop` on the `started` modules in reverse order after a
+    /// failed bootstrap and appends each failure to `errors`.
+    async fn roll_back(root: &Injector, mut started: Vec<LoadedModule>, errors: &mut Vec<Error>) {
+        Self::end_live_production(root);
+        while let Some(loaded) = started.pop() {
+            let module_name = std::any::type_name_of_val(&*loaded.module);
+            if let Err(err) = loaded.module.on_stop(loaded.injector.clone()).await {
+                errors.push(Error::module_lifecycle_failed_with_source(
+                    module_name,
+                    "on_stop",
+                    err,
+                ));
+            }
         }
     }
 }

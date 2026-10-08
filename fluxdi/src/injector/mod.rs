@@ -300,6 +300,8 @@ mod graph_validation;
 mod in_flight_cell_tests;
 #[cfg(feature = "live")]
 pub(crate) mod live_cells;
+#[cfg(all(test, feature = "async-factory"))]
+mod optional_resolve_tests;
 
 #[cfg(not(feature = "thread-safe"))]
 mod nts_instance_factory;

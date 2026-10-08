@@ -251,6 +251,19 @@ impl Error {
         )
     }
 
+    /// A module's lifecycle `phase` failed with `source`, which is the
+    /// [`Error`]'s `source()`; its text is the message's `details`.
+    pub fn module_lifecycle_failed_with_source(
+        module_name: &str,
+        phase: &str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        let source = source.into();
+        let mut error = Self::module_lifecycle_failed(module_name, phase, &source.to_string());
+        error.source = Some(Arc::from(source));
+        error
+    }
+
     /// Dynamic provider not found by name.
     pub fn dynamic_provider_not_found(name: &str) -> Self {
         Self::new(
@@ -449,11 +462,14 @@ impl Error {
     /// Bootstrap failed with multiple module errors (aggregated).
     ///
     /// Used when `on_start` fails for one or more modules during bootstrap,
-    /// e.g. when using `parallel_start`.
+    /// e.g. when using `parallel_start`, and for `on_stop` failures during
+    /// the rollback. Every failure is in the message; the first one is the
+    /// error's `source()`.
     pub fn bootstrap_aggregate(errors: Vec<Error>) -> Self {
         if errors.len() == 1 {
             return errors.into_iter().next().unwrap();
         }
+        let first = errors[0].clone();
         let message = format!(
             "Bootstrap failed: {} module(s) reported errors:\n{}",
             errors.len(),
@@ -464,17 +480,21 @@ impl Error {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        Self::new(ErrorKind::ModuleLifecycleFailed, message)
+        let mut error = Self::new(ErrorKind::ModuleLifecycleFailed, message);
+        error.source = Some(Arc::new(first));
+        error
     }
 
     /// Shutdown failed with multiple module errors (aggregated).
     ///
     /// Used when `on_stop` fails for one or more modules during shutdown.
-    /// The returned error lists all failures for diagnostics.
+    /// The returned error lists all failures for diagnostics; the first one
+    /// is its `source()`.
     pub fn shutdown_aggregate(errors: Vec<Error>) -> Self {
         if errors.len() == 1 {
             return errors.into_iter().next().unwrap();
         }
+        let first = errors[0].clone();
         let message = format!(
             "Shutdown failed: {} module(s) reported errors:\n{}",
             errors.len(),
@@ -485,7 +505,9 @@ impl Error {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        Self::new(ErrorKind::ModuleLifecycleFailed, message)
+        let mut error = Self::new(ErrorKind::ModuleLifecycleFailed, message);
+        error.source = Some(Arc::new(first));
+        error
     }
 }
 

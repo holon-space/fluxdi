@@ -305,6 +305,10 @@ impl Injector {
         self.try_resolve_named::<T>(name).unwrap()
     }
 
+    /// Resolves `T`, or returns `None` when the resolve fails for any
+    /// reason, including a failed factory. [`try_optional_resolve`](Self::try_optional_resolve)
+    /// returns `None` only when no provider of `T` is registered.
+    #[deprecated(note = "swallows factory failures; use try_optional_resolve*")]
     pub fn optional_resolve<T>(&self) -> Option<Shared<T>>
     where
         T: ?Sized + 'static,
@@ -312,6 +316,22 @@ impl Injector {
         self.try_resolve::<T>().ok()
     }
 
+    /// Resolves `T`; `Ok(None)` only when no provider of `T` is registered.
+    /// Every other failure, such as a failed factory, is returned.
+    pub fn try_optional_resolve<T>(&self) -> Result<Option<Shared<T>>, Error>
+    where
+        T: ?Sized + 'static,
+    {
+        if self.get_provider::<T>().is_none() {
+            return Ok(None);
+        }
+        self.try_resolve::<T>().map(Some)
+    }
+
+    /// Resolves every member of the `T` set, or returns `None` when the resolve fails for any
+    /// reason, including a failed factory. [`try_optional_resolve_all`](Self::try_optional_resolve_all)
+    /// returns `None` only when no set provider of `T` is registered.
+    #[deprecated(note = "swallows factory failures; use try_optional_resolve*")]
     pub fn optional_resolve_all<T>(&self) -> Option<Vec<Shared<T>>>
     where
         T: ?Sized + 'static,
@@ -319,10 +339,40 @@ impl Injector {
         self.try_resolve_all::<T>().ok()
     }
 
+    /// Resolves every member of the `T` set; `Ok(None)` only when no set provider of `T` is registered.
+    /// Every other failure, such as a failed factory, is returned.
+    pub fn try_optional_resolve_all<T>(&self) -> Result<Option<Vec<Shared<T>>>, Error>
+    where
+        T: ?Sized + 'static,
+    {
+        let mut providers = Vec::new();
+        self.collect_set_providers::<T>(&mut providers)?;
+        if providers.is_empty() {
+            return Ok(None);
+        }
+        self.try_resolve_all::<T>().map(Some)
+    }
+
+    /// Resolves `T` named `name`, or returns `None` when the resolve fails for any
+    /// reason, including a failed factory. [`try_optional_resolve_named`](Self::try_optional_resolve_named)
+    /// returns `None` only when no provider of `T` is registered under `name`.
+    #[deprecated(note = "swallows factory failures; use try_optional_resolve*")]
     pub fn optional_resolve_named<T>(&self, name: &str) -> Option<Shared<T>>
     where
         T: ?Sized + 'static,
     {
         self.try_resolve_named::<T>(name).ok()
+    }
+
+    /// Resolves `T` named `name`; `Ok(None)` only when no provider of `T` is registered under `name`.
+    /// Every other failure, such as a failed factory, is returned.
+    pub fn try_optional_resolve_named<T>(&self, name: &str) -> Result<Option<Shared<T>>, Error>
+    where
+        T: ?Sized + 'static,
+    {
+        if self.get_provider_named::<T>(name).is_none() {
+            return Ok(None);
+        }
+        self.try_resolve_named::<T>(name).map(Some)
     }
 }

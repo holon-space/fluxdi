@@ -85,6 +85,24 @@ fn module_lifecycle_failed_error() {
 }
 
 #[test]
+fn module_lifecycle_failed_with_source_keeps_the_message_and_the_source() {
+    let err = Error::module_lifecycle_failed_with_source(
+        "WebModule",
+        "on_start",
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "bind failed"),
+    );
+    assert_eq!(
+        err.message,
+        Error::module_lifecycle_failed("WebModule", "on_start", "bind failed").message
+    );
+    let source = std::error::Error::source(&err)
+        .expect("source kept")
+        .downcast_ref::<std::io::Error>()
+        .expect("source is the io::Error");
+    assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
+}
+
+#[test]
 fn graph_validation_failed_error() {
     let err = Error::graph_validation_failed("missing Foo");
     assert!(err.kind == ErrorKind::GraphValidationFailed);

@@ -68,6 +68,7 @@ fn async_transient_provider_is_not_cached() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn optional_resolve_async_returns_none_for_missing_service() {
     let injector = Injector::root();
     let value = block_on(injector.optional_resolve_async::<String>());

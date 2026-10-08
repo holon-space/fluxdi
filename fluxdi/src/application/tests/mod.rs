@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 mod bootstrap_and_lifecycle;
+mod error_source;
 #[cfg(feature = "live")]
 mod live_shutdown;
 mod state_and_structure;
