@@ -262,3 +262,44 @@ fn rollback_on_stop_failures_are_reported_after_the_start_failure() {
         assert_keeps_typed_source(first, "on_start");
     }
 }
+
+/// Fails `configure` after its import started; the import's `on_stop` fails
+/// during the rollback.
+struct FailsConfigureAfterImportStarted;
+
+impl Module for FailsConfigureAfterImportStarted {
+    fn imports(&self) -> Vec<Box<dyn Module>> {
+        vec![Box::new(TypedFailureModule::fails_in(Phase::OnStop))]
+    }
+
+    fn configure(&self, _: &Injector) -> Result<(), Error> {
+        Err(typed_failure())
+    }
+}
+
+#[test]
+fn rollback_on_stop_failures_are_reported_after_the_configure_failure() {
+    let mut app = Application::new(FailsConfigureAfterImportStarted);
+    let err = block_on(app.bootstrap()).unwrap_err();
+    assert!(
+        err.message.contains("2 module(s) reported errors")
+            && err.message.contains("phase=configure")
+            && err.message.contains("phase=on_stop"),
+        "{}",
+        err.message
+    );
+    let first = std::error::Error::source(&err)
+        .expect("the aggregate keeps the configure failure as its source")
+        .downcast_ref::<Error>()
+        .expect("the aggregate's source is a fluxdi Error");
+    assert_keeps_typed_source(first, "configure");
+}
+
+#[test]
+fn a_parallel_configure_failure_stops_no_module_because_none_started() {
+    let mut app = Application::new(FailsConfigureAfterImportStarted);
+    let opts = BootstrapOptions::default().with_parallel_start(true);
+    let err = block_on(app.bootstrap_with_options(opts)).unwrap_err();
+    assert_keeps_typed_source(&err, "configure");
+    assert!(!err.message.contains("phase=on_stop"), "{}", err.message);
+}

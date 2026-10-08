@@ -300,12 +300,15 @@ pub fn try_init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync 
         .try_init()
 }
 
-/// Initializes logging and ignores repeated initialization errors.
+/// Initializes logging; a failure, e.g. a global subscriber that is already
+/// set, is reported on stderr and does not fail the caller.
 ///
 /// Use [`try_init_logging`] if you need to handle initialization failures.
 #[cfg(feature = "logging")]
 pub fn init_logging() {
-    let _ = try_init_logging();
+    if let Err(err) = try_init_logging() {
+        eprintln!("fluxdi: logging was not initialized: {err}");
+    }
 }
 
 #[cfg(feature = "opentelemetry")]

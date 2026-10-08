@@ -55,7 +55,10 @@ impl Application {
         #[cfg(feature = "tracing")]
         info!("Starting application bootstrap process");
 
-        Self::load_module(self.injector.clone(), root)?;
+        if let Err(err) = Self::load_module(self.injector.clone(), root) {
+            Self::end_live_production(&self.injector);
+            return Err(err);
+        }
 
         #[cfg(feature = "tracing")]
         info!("Application bootstrap completed successfully");
@@ -230,7 +233,8 @@ impl Application {
         }
     }
 
-    /// Runs before every `on_stop`, at shutdown and at bootstrap rollback.
+    /// Runs before every `on_stop`, at shutdown and at bootstrap rollback,
+    /// and when a synchronous bootstrap fails.
     #[cfg(feature = "live")]
     pub(super) fn end_live_production(root: &Injector) {
         root.shutdown_live();

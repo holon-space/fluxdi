@@ -288,7 +288,7 @@ impl Injector {
                 hit = true,
                 "Instance cache hit"
             );
-            return local.and_then(|instance| instance.downcast::<Instance<T>>().ok());
+            return local.map(stored_instance::<T>);
         }
 
         #[cfg(feature = "tracing")]
@@ -347,7 +347,7 @@ impl Injector {
             "Set-binding instance lookup completed"
         );
 
-        local.and_then(|instance| instance.downcast::<Instance<T>>().ok())
+        local.map(stored_instance::<T>)
     }
 
     pub(crate) fn get_instance_named<T>(&self, name: &str) -> Option<Shared<Instance<T>>>
@@ -369,7 +369,7 @@ impl Injector {
                 hit = true,
                 "Named instance cache hit"
             );
-            return local.and_then(|instance| instance.downcast::<Instance<T>>().ok());
+            return local.map(stored_instance::<T>);
         }
 
         #[cfg(feature = "tracing")]

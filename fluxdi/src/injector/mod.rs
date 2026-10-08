@@ -318,6 +318,32 @@ mod nts_storage;
 
 #[cfg(feature = "dynamic")]
 mod ts_dynamic;
+/// Only an `Instance<T>` is cached under a key derived from `T`.
+#[cfg(not(feature = "thread-safe"))]
+fn stored_instance<T: ?Sized + 'static>(stored: Shared<dyn Any>) -> Shared<Instance<T>> {
+    stored.downcast::<Instance<T>>().unwrap_or_else(|_| {
+        panic!(
+            "the instance cache holds a value under the key of {0} that is not an Instance<{0}>",
+            std::any::type_name::<T>()
+        )
+    })
+}
+
+/// Only an `Instance<T>` is cached under a key derived from `T`.
+#[cfg(feature = "thread-safe")]
+fn stored_instance<T: ?Sized + Send + Sync + 'static>(
+    stored: Shared<dyn Any + Send + Sync>,
+) -> Shared<Instance<T>> {
+    stored.downcast::<Instance<T>>().unwrap_or_else(|_| {
+        panic!(
+            "the instance cache holds a value under the key of {0} that is not an Instance<{0}>",
+            std::any::type_name::<T>()
+        )
+    })
+}
+
+#[cfg(test)]
+mod stored_instance_tests;
 #[cfg(feature = "thread-safe")]
 mod ts_instance_factory;
 #[cfg(feature = "thread-safe")]

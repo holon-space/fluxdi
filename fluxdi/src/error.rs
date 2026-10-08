@@ -350,12 +350,17 @@ impl Error {
         error
     }
 
-    /// The factory of `type_name` panicked with `panic`.
+    /// The factory of `type_name` panicked with `panic`, which is the
+    /// [`Error`]'s `source()` as a [`FactoryPanic`].
     pub fn factory_panicked(type_name: &str, panic: &str) -> Self {
-        Self::new(
+        let mut error = Self::new(
             ErrorKind::FactoryFailed,
             format!("Factory for type {} panicked: {}", type_name, panic),
-        )
+        );
+        error.source = Some(Arc::new(FactoryPanic {
+            message: panic.to_string(),
+        }));
+        error
     }
 
     /// A live dependency's producer was cancelled before it finished.
@@ -461,9 +466,9 @@ impl Error {
 
     /// Bootstrap failed with multiple module errors (aggregated).
     ///
-    /// Used when `on_start` fails for one or more modules during bootstrap,
-    /// e.g. when using `parallel_start`, and for `on_stop` failures during
-    /// the rollback. Every failure is in the message; the first one is the
+    /// Used when `configure` or `on_start` fails during bootstrap (several
+    /// `on_start` failures with `parallel_start`), followed by the `on_stop`
+    /// failures of the rollback. Every failure is in the message; the first one is the
     /// error's `source()`.
     pub fn bootstrap_aggregate(errors: Vec<Error>) -> Self {
         if errors.len() == 1 {
@@ -510,6 +515,24 @@ impl Error {
         error
     }
 }
+
+/// The panic of a factory, the `source()` of [`Error::factory_panicked`].
+///
+/// It holds no location: a caught panic payload carries none, only a
+/// process-wide panic hook sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactoryPanic {
+    /// The panic payload when it is a string.
+    pub message: String,
+}
+
+impl fmt::Display for FactoryPanic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for FactoryPanic {}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

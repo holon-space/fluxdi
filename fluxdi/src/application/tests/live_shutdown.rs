@@ -219,3 +219,81 @@ async fn a_rollback_on_stop_waiting_on_a_live_producer_sees_its_cancellation() {
 async fn a_parallel_rollback_on_stop_waiting_on_a_live_producer_sees_its_cancellation() {
     assert_rollback_on_stop_sees_the_cancellation(true).await;
 }
+
+/// Starts `Endless` live in `configure`, then fails its own configure.
+struct FailsConfigureAfterLiveStart {
+    seen: Arc<Mutex<Option<Error>>>,
+}
+
+impl Module for FailsConfigureAfterLiveStart {
+    fn imports(&self) -> Vec<Box<dyn Module>> {
+        vec![Box::new(EndlessModule {
+            wait_on_stop: Some(self.seen.clone()),
+        })]
+    }
+
+    fn configure(&self, injector: &Injector) -> Result<(), Error> {
+        injector.resolve_live::<Endless>();
+        Err(Error::module_lifecycle_failed(
+            "FailsConfigureAfterLiveStart",
+            "configure",
+            "intentional test failure",
+        ))
+    }
+}
+
+async fn assert_configure_failure_cancels_the_producer(app: &Application) {
+    let error = timeout(HANG, app.injector().resolve_live::<Endless>().ready())
+        .await
+        .expect("the live producer outlived the failed bootstrap")
+        .err()
+        .expect("Endless became ready");
+    assert_eq!(error.kind, ErrorKind::LiveProducerCancelled, "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configure_failure_rolls_back_the_started_modules_and_live_production() {
+    let seen = Arc::new(Mutex::new(None));
+    let mut app = Application::new(FailsConfigureAfterLiveStart { seen: seen.clone() });
+
+    let error = timeout(HANG, app.bootstrap())
+        .await
+        .expect("a rollback on_stop waited for ever on a live producer")
+        .unwrap_err();
+    assert!(error.message.contains("phase=configure"), "{error}");
+    let seen = seen.lock().unwrap().clone().expect("on_stop did not run");
+    assert_eq!(seen.kind, ErrorKind::LiveProducerCancelled, "{seen}");
+    assert_configure_failure_cancels_the_producer(&app).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parallel_configure_failure_ends_live_production() {
+    let seen = Arc::new(Mutex::new(None));
+    let mut app = Application::new(FailsConfigureAfterLiveStart { seen: seen.clone() });
+
+    let error = timeout(
+        HANG,
+        app.bootstrap_with_options(
+            crate::application::options::BootstrapOptions::default().with_parallel_start(true),
+        ),
+    )
+    .await
+    .expect("the bootstrap hung")
+    .unwrap_err();
+    assert!(error.message.contains("phase=configure"), "{error}");
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "a module that never started was stopped"
+    );
+    assert_configure_failure_cancels_the_producer(&app).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_configure_failure_ends_live_production() {
+    let seen = Arc::new(Mutex::new(None));
+    let mut app = Application::new(FailsConfigureAfterLiveStart { seen });
+
+    let error = app.bootstrap_sync().unwrap_err();
+    assert!(error.message.contains("phase=configure"), "{error}");
+    assert_configure_failure_cancels_the_producer(&app).await;
+}

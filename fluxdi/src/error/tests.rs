@@ -166,3 +166,19 @@ fn bootstrap_aggregate_single_error_returns_unchanged() {
     assert!(err.message.contains("A"));
     assert!(err.message.contains("detail"));
 }
+
+#[test]
+fn factory_panicked_keeps_the_panic_as_a_typed_source() {
+    let err = Error::factory_panicked("SessionStore", "store poisoned");
+    assert_eq!(err.kind, ErrorKind::FactoryFailed);
+    assert!(
+        err.message.contains("panicked: store poisoned"),
+        "{}",
+        err.message
+    );
+    let panic = std::error::Error::source(&err)
+        .expect("the panic is the error's source")
+        .downcast_ref::<FactoryPanic>()
+        .expect("the source is a FactoryPanic");
+    assert_eq!(panic.message, "store poisoned");
+}

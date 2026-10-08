@@ -104,9 +104,15 @@ impl Application {
                     module,
                 } => {
                     let module_name = std::any::type_name_of_val(&*module);
-                    module.configure(&module_injector).map_err(|err| {
-                        Error::module_lifecycle_failed_with_source(module_name, "configure", err)
-                    })?;
+                    if let Err(err) = module.configure(&module_injector) {
+                        let mut errors = vec![Error::module_lifecycle_failed_with_source(
+                            module_name,
+                            "configure",
+                            err,
+                        )];
+                        Self::roll_back(&root, loaded, &mut errors).await;
+                        return Err(Error::bootstrap_aggregate(errors));
+                    }
 
                     if let Err(err) = module.on_start(module_injector.clone()).await {
                         let mut errors = vec![Error::module_lifecycle_failed_with_source(
@@ -172,9 +178,15 @@ impl Application {
                     module,
                 } => {
                     let module_name = std::any::type_name_of_val(&*module);
-                    module.configure(&module_injector).map_err(|err| {
-                        Error::module_lifecycle_failed_with_source(module_name, "configure", err)
-                    })?;
+                    if let Err(err) = module.configure(&module_injector) {
+                        let mut errors = vec![Error::module_lifecycle_failed_with_source(
+                            module_name,
+                            "configure",
+                            err,
+                        )];
+                        Self::roll_back(&root, Vec::new(), &mut errors).await;
+                        return Err(Error::bootstrap_aggregate(errors));
+                    }
 
                     pending.push((module, module_injector));
                 }
